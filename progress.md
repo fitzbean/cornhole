@@ -1,0 +1,26 @@
+Original prompt: Change the throw mechanic to a slingshot type of mechanic where you pull back on the mouse when holding down the button to aim and power
+
+- Reworked the throw flow in `src/CornholeGame.ts` from move-and-click to hold-drag-release.
+- Added drag-aware aiming state and surfaced `aimPower` through `GameState` for the HUD.
+- Added screen-space drag coordinates and a React overlay line so the pullback vector is visible while holding the mouse.
+- Made HUD overlays ignore pointer events so pullback can reach full power near the bottom of the screen.
+- Increased pull sensitivity and changed the power curve so full power is reachable with a shorter downward drag.
+- Increased high-power launch speed and vertical lift so a full pull can actually reach the board.
+- Added a left-side inset top-down board camera rendered from Three for close-up bag/board visibility.
+- Pullback sets distance while the speed meter cycles continuously again and locks in on release.
+- Raised the speed meter floor and extended the top-end launch speed so the slowest throws stay useful and the fastest throws hit harder.
+- Cleared stale `lastResult` state when a new throw starts so miss text does not persist across later aim phases.
+- Reset `bagsRemaining` when switching to Player 2 and simplified the HUD to avoid duplicate miss/+0 feedback.
+- Flattened high-speed throws so faster releases behave more like line drives instead of adding extra loft.
+- Removed the large white trajectory preview entirely; only the pullback guide remains while dragging.
+- Removed the near-camera white throw-line plane that was still showing up as a large foreground shape.
+- Made the speed meter update continuously from the live oscillation and stabilized the main HUD message during aiming so it no longer flips between turn/instruction text.
+- Enlarged the board cam by about 20% and reduced the overlay blur/frame intensity so the inset reads clearer.
+- Increased `BAG_SIZE` by about 20% so the bag visuals and collision size better match the board scale.
+- Decoupled horizontal travel time from the speed meter so pullback controls range and low speed no longer shortens distance.
+- Cleared drag coordinates on release/cancel and gated the React pullback overlay on active dragging so the line does not stick on screen.
+- Removed the static target/reticle from both the Three scene and the React overlay since it was not providing useful feedback.
+- Increased lateral launch sensitivity so horizontal aim changes the bag's actual flight direction much more clearly.
+- Added `ArrowLeft`/`ArrowRight` player movement so the camera and throw origin shift laterally with the player.
+- Added `window.render_game_to_text` and `window.advanceTime(ms)` for deterministic browser validation.
+- TODO: Run build and browser checks, inspect screenshot/text output, and tune drag sensitivity if the throw feels off.
