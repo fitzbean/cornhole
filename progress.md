@@ -22,5 +22,23 @@ Original prompt: Change the throw mechanic to a slingshot type of mechanic where
 - Removed the static target/reticle from both the Three scene and the React overlay since it was not providing useful feedback.
 - Increased lateral launch sensitivity so horizontal aim changes the bag's actual flight direction much more clearly.
 - Added `ArrowLeft`/`ArrowRight` player movement so the camera and throw origin shift laterally with the player.
+- Added sticky/slick bag sides with distinct materials, `F` to flip before the throw, a HUD bag-face preview, and face-dependent landing behavior by switching sticky/slick contact physics based on which bag face is actually pointing down.
+- Replaced the random tumble on release with a more realistic bag throw: slight pitch/roll plus a strong flat spin and only a small wobble.
+- Further reduced slick-side landing friction/damping because the first pass still killed too much velocity to show a meaningful slide.
+- Changed the sticky face art to use lighter/darker shades of each bag's base color instead of tan so it still reads as the same team bag.
+- Increased the high end of the speed meter effect by shortening flight time more aggressively, flattening the arc harder, and boosting spin so fast releases read clearly faster.
+- Added explicit hole capture logic because the board collider is solid; bags near the visual opening now drop through and can score 3.
+- Moved score application out of `emitState()` and into `evaluateThrow()` so cornholes/other scores are credited immediately to the correct player before turn switches.
 - Added `window.render_game_to_text` and `window.advanceTime(ms)` for deterministic browser validation.
+- Reworked the right-side bag preview from a flat icon into a larger bag-shaped illustration with seams, depth, and shadow so the current sticky/slick side reads like an actual bag.
+- Replaced the right-side fake bag illustration with a real 3D bag preview rendered by Three into its own viewport, matching the active player color and selected sticky/slick side.
+- Recentered and sharpened the 3D bag preview by fixing the right-side viewport placement, widening the preview framing, and reducing the panel blur over the rendered bag.
+- Replaced the preview viewport's hardcoded screen offsets with the actual DOM box bounds so the 3D bag stays inside the right-side frame during window resize/layout changes.
+- Reduced bag bounce by lowering restitution across bag-to-board, bag-to-ground, and bag-to-bag contact materials to near-zero values.
+- Changed inning flow to alternate players every throw, remember sticky/slick side separately for each player, and track bags-left plus running round totals independently for both players in state and HUD.
+- Changed the HUD bag counts to reserve one bag immediately for the active player, so the readout drops at turn start instead of waiting for throw resolution.
+- Replaced the bag-count hack with a proper game-state reservation model: each turn now reserves one bag at turn start, the active player can still throw their last bag at visible zero, and the HUD reads directly from per-player counts without double-depleting.
+- Refined bag accounting so actual inventory only decrements once on throw resolution while the HUD keeps a stable one-bag reservation for the active player through aiming and flight, eliminating the throw-time add-back flicker.
+- Changed bag depletion timing again so counts now stay full during aiming and decrement exactly when the throw is released; the HUD once again shows raw per-player inventory directly from game state.
+- Reworked bag tracking around per-player "bags thrown this round" counters, with HUD bag counts derived from that source in `emitState()`, so counts only move downward after release and cannot refill mid-round.
 - TODO: Run build and browser checks, inspect screenshot/text output, and tune drag sensitivity if the throw feels off.

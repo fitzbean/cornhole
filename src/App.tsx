@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { CornholeGame, GameState } from './CornholeGame';
+import { BagSide, CornholeGame, GameState } from './CornholeGame';
 
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const gameRef = useRef<CornholeGame | null>(null);
   const [gameState, setGameState] = useState<GameState>({
     bagsRemaining: 4,
+    player1BagsLeft: 4,
+    player2BagsLeft: 4,
     isAiming: true,
     isThrowing: false,
     isSettling: false,
@@ -17,7 +19,11 @@ function App() {
     message: 'Use left/right arrows to move. Pull for distance, release to lock speed.',
     player1Score: 0,
     player2Score: 0,
+    player1RoundScore: 0,
+    player2RoundScore: 0,
     currentPlayer: 1,
+    turnIndicatorPlayer: 1,
+    throwingPlayer: null,
     inning: 1,
     bagsThisInning: 0,
     showResult: false,
@@ -26,6 +32,7 @@ function App() {
     lastPoints: 0,
     lastResult: '',
     aimPower: 0.65,
+    selectedBagSide: 'sticky',
   });
   const [lastScore, setLastScore] = useState<number | null>(null);
   const [showScorePopup, setShowScorePopup] = useState(false);
@@ -57,10 +64,6 @@ function App() {
     };
   }, [handleStateChange, handleScoreUpdate]);
 
-  const bagColors = gameState.currentPlayer === 1
-    ? ['bg-red-500', 'border-red-400']
-    : ['bg-blue-500', 'border-blue-400'];
-
   const dragLine = gameState.isDragging && gameState.isAiming && !gameState.isThrowing
     ? {
         x1: `${gameState.dragStartX * 100}%`,
@@ -70,7 +73,24 @@ function App() {
       }
     : null;
 
-  const currentPlayerLabel = gameState.currentPlayer === 1 ? 'Player 1' : 'Player 2';
+  const visualTurnPlayer = gameState.isThrowing && gameState.throwingPlayer !== null
+    ? gameState.throwingPlayer
+    : gameState.turnIndicatorPlayer;
+  const currentPlayerLabel = visualTurnPlayer === 1 ? 'Player 1' : 'Player 2';
+  const selectedSide: BagSide = gameState.selectedBagSide;
+  const sideLabel = selectedSide === 'sticky' ? 'Sticky Side' : 'Slick Side';
+  const renderBagDots = (count: number, activeClasses: string) => (
+    <div className="flex gap-1.5">
+      {Array.from({ length: 4 }).map((_, i) => (
+        <div
+          key={i}
+          className={`h-4 w-4 rounded-full border transition-all duration-300 ${
+            i < count ? activeClasses : 'border-gray-600 bg-gray-700'
+          }`}
+        />
+      ))}
+    </div>
+  );
   const displayMessage = gameState.showResult || gameState.gameOver
     ? gameState.message
     : gameState.isThrowing
@@ -126,9 +146,12 @@ function App() {
 
       <div className="pointer-events-none absolute left-0 right-0 top-0 z-10">
         <div className="flex items-start justify-between p-4">
-          <div className={`rounded-xl border-2 bg-black/60 px-5 py-3 backdrop-blur-sm transition-all duration-300 ${gameState.currentPlayer === 1 ? 'border-red-500 shadow-lg shadow-red-500/30' : 'border-gray-700'}`}>
+          <div className={`rounded-xl border-2 px-5 py-3 backdrop-blur-sm transition-all duration-300 ${visualTurnPlayer === 1 ? 'border-red-500 bg-red-950/60 shadow-[0_0_20px_rgba(239,68,68,0.4),0_0_40px_rgba(239,68,68,0.15)] scale-105' : 'border-gray-700 bg-black/60 opacity-70'}`}>
             <div className="text-xs font-bold uppercase tracking-wider text-red-400">Player 1</div>
             <div className="text-3xl font-black text-white">{gameState.player1Score}</div>
+            <div className="mt-1 text-xs font-semibold uppercase tracking-wider text-gray-400">Round {gameState.player1RoundScore}</div>
+            <div className="mt-3 text-[11px] font-bold uppercase tracking-wider text-gray-500">Bags Left</div>
+            <div className="mt-2">{renderBagDots(gameState.player1BagsLeft, 'border-red-400 bg-red-500')}</div>
           </div>
 
           <div className="rounded-xl border border-gray-700 bg-black/60 px-6 py-3 text-center backdrop-blur-sm">
@@ -137,47 +160,47 @@ function App() {
             <div className="mt-1 text-xs text-gray-500">First to 21 wins</div>
           </div>
 
-          <div className={`rounded-xl border-2 bg-black/60 px-5 py-3 backdrop-blur-sm transition-all duration-300 ${gameState.currentPlayer === 2 ? 'border-blue-500 shadow-lg shadow-blue-500/30' : 'border-gray-700'}`}>
+          <div className={`rounded-xl border-2 px-5 py-3 backdrop-blur-sm transition-all duration-300 ${visualTurnPlayer === 2 ? 'border-blue-500 bg-blue-950/60 shadow-[0_0_20px_rgba(59,130,246,0.4),0_0_40px_rgba(59,130,246,0.15)] scale-105' : 'border-gray-700 bg-black/60 opacity-70'}`}>
             <div className="text-xs font-bold uppercase tracking-wider text-blue-400">Player 2</div>
             <div className="text-3xl font-black text-white">{gameState.player2Score}</div>
+            <div className="mt-1 text-xs font-semibold uppercase tracking-wider text-gray-400">Round {gameState.player2RoundScore}</div>
+            <div className="mt-3 text-[11px] font-bold uppercase tracking-wider text-gray-500">Bags Left</div>
+            <div className="mt-2">{renderBagDots(gameState.player2BagsLeft, 'border-blue-400 bg-blue-500')}</div>
           </div>
         </div>
       </div>
 
       <div className="pointer-events-none absolute bottom-0 left-0 right-0 z-10">
         <div className="flex items-end justify-between p-4">
-          <div className="rounded-xl border border-gray-700 bg-black/60 px-5 py-3 backdrop-blur-sm">
-            <div className="mb-2 text-xs font-bold uppercase tracking-wider text-gray-400">Bags Left</div>
-            <div className="flex gap-1.5">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <div
-                  key={i}
-                  className={`h-5 w-5 rounded-full border-2 transition-all duration-300 ${
-                    i < gameState.bagsRemaining ? `${bagColors[0]} ${bagColors[1]}` : 'border-gray-600 bg-gray-700'
-                  }`}
-                />
-              ))}
-            </div>
-          </div>
-
           <div className="max-w-md rounded-xl border border-gray-700 bg-black/60 px-6 py-3 text-center backdrop-blur-sm">
             <div className="text-lg font-bold text-white">{displayMessage}</div>
           </div>
 
-          <div className="rounded-xl border border-gray-700 bg-black/60 px-5 py-3 backdrop-blur-sm">
-            <div className="mb-2 text-xs font-bold uppercase tracking-wider text-gray-400">
-              Speed
-            </div>
-            <div className="h-3 w-32 overflow-hidden rounded-full bg-gray-700">
-              <div
-                className="h-full rounded-full transition-none"
-                style={{
-                  width: `${power}%`,
-                  background: 'linear-gradient(90deg, #22c55e, #eab308, #ef4444)',
-                }}
-              />
-            </div>
-          </div>
+          <div className="w-[220px]" />
+        </div>
+      </div>
+
+      <div className="pointer-events-none absolute bottom-4 right-4 z-10 w-[220px] rounded-xl border border-gray-700 bg-black/68 px-5 py-4 backdrop-blur-[1px]">
+        <div className="mb-3 text-left">
+          <div className="text-xs font-bold uppercase tracking-wider text-gray-400">Current Bag</div>
+          <div className="text-sm font-semibold text-white">{sideLabel}</div>
+          <div className="text-[11px] text-gray-400">Press F to flip sides</div>
+        </div>
+        <div
+          id="bag-preview-viewport"
+          className="mb-4 h-[132px] rounded-[22px] border border-white/10 bg-black/8 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
+        />
+        <div className="mb-2 text-xs font-bold uppercase tracking-wider text-gray-400">
+          Speed
+        </div>
+        <div className="h-3 w-full overflow-hidden rounded-full bg-gray-700">
+          <div
+            className="h-full rounded-full transition-none"
+            style={{
+              width: `${power}%`,
+              background: 'linear-gradient(90deg, #22c55e, #eab308, #ef4444)',
+            }}
+          />
         </div>
       </div>
 
@@ -185,7 +208,7 @@ function App() {
         <div className="pointer-events-none absolute bottom-24 left-1/2 z-20 -translate-x-1/2">
           <div className="rounded-full border border-white/20 bg-black/70 px-6 py-2 backdrop-blur-sm">
             <span className="text-sm font-medium text-white/80">
-              Left/right arrows move. Pull for distance, release to lock speed
+              Left/right arrows move. F flips the bag. Pull for distance, release to lock speed
             </span>
           </div>
         </div>

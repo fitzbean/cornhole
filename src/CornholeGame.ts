@@ -15,6 +15,8 @@ const BAG_MASS = 0.45;
 const PITCH_LENGTH = 27; // feet in real game, we use scaled units
 const GRAVITY = -9.81;
 
+export type BagSide = 'sticky' | 'slick';
+
 declare global {
   interface Window {
     render_game_to_text?: () => string;
@@ -24,6 +26,8 @@ declare global {
 
 export interface GameState {
   bagsRemaining: number;
+  player1BagsLeft: number;
+  player2BagsLeft: number;
   isAiming: boolean;
   isThrowing: boolean;
   isSettling: boolean;
@@ -35,7 +39,11 @@ export interface GameState {
   message: string;
   player1Score: number;
   player2Score: number;
+  player1RoundScore: number;
+  player2RoundScore: number;
   currentPlayer: 1 | 2;
+  turnIndicatorPlayer: 1 | 2;
+  throwingPlayer: 1 | 2 | null;
   inning: number;
   bagsThisInning: number; // 0-7 (each player throws 4)
   showResult: boolean;
@@ -44,15 +52,22 @@ export interface GameState {
   lastPoints: number;
   lastResult: string;
   aimPower: number;
+  selectedBagSide: BagSide;
 }
 
 export class CornholeGame {
   scene: THREE.Scene;
   camera: THREE.PerspectiveCamera;
   boardCamera: THREE.OrthographicCamera;
+  previewScene: THREE.Scene;
+  previewCamera: THREE.OrthographicCamera;
+  previewBag!: THREE.Mesh;
+  previewPlayer: 1 | 2 = 1;
   renderer: THREE.WebGLRenderer;
   world: CANNON.World;
   clock = new THREE.Clock();
+  stickyBagMaterial!: CANNON.Material;
+  slickBagMaterial!: CANNON.Material;
 
   // Game objects
   boardGroup!: THREE.Group;
@@ -60,6 +75,8 @@ export class CornholeGame {
   groundBody!: CANNON.Body;
   bags: THREE.Mesh[] = [];
   bagBodies: CANNON.Body[] = [];
+  bagSides: BagSide[] = Array(8).fill('sticky');
+  bagInHole: boolean[] = Array(8).fill(false);
   pullLine!: THREE.Line;
   trailPoints: THREE.Vector3[] = [];
   trailLine!: THREE.Line;
@@ -67,6 +84,8 @@ export class CornholeGame {
   // State
   state: GameState = {
     bagsRemaining: 4,
+    player1BagsLeft: 4,
+    player2BagsLeft: 4,
     isAiming: true,
     isThrowing: false,
     isSettling: false,
@@ -78,7 +97,11 @@ export class CornholeGame {
     message: 'Pull for distance, release to lock speed.',
     player1Score: 0,
     player2Score: 0,
+    player1RoundScore: 0,
+    player2RoundScore: 0,
     currentPlayer: 1,
+    turnIndicatorPlayer: 1,
+    throwingPlayer: null,
     inning: 1,
     bagsThisInning: 0,
     showResult: false,
@@ -87,6 +110,7 @@ export class CornholeGame {
     lastPoints: 0,
     lastResult: '',
     aimPower: 0.65,
+    selectedBagSide: 'sticky',
   };
 
   // Aiming
@@ -96,7 +120,10 @@ export class CornholeGame {
   playerX = 0;
   moveLeftPressed = false;
   moveRightPressed = false;
-  currentBagIndex = 0;
+  selectedBagSide: BagSide = 'sticky';
+  playerBagSides: Record<1 | 2, BagSide> = { 1: 'sticky', 2: 'sticky' };
+  playerBagsThrown: Record<1 | 2, number> = { 1: 0, 2: 0 };
+  currentTurnBagReady = false;
   dragStart = new THREE.Vector2();
   dragCurrent = new THREE.Vector2();
   isDragging = false;
@@ -108,6 +135,7 @@ export class CornholeGame {
 
   // Particles
   particleSystems: { points: THREE.Points; velocities: THREE.Vector3[]; life: number }[] = [];
+  stickyFaceNormal = new CANNON.Vec3(0, 1, 0);
 
   // Bag throw animation
   throwStartTime = 0;
@@ -140,6 +168,11 @@ export class CornholeGame {
     this.boardCamera.up.set(0, 0, -1);
     this.boardCamera.lookAt(0, 0.7, -10);
 
+    this.previewScene = new THREE.Scene();
+    this.previewCamera = new THREE.OrthographicCamera(-1.4, 1.4, 1.1, -1.1, 0.1, 20);
+    this.previewCamera.position.set(0, 0, 3);
+    this.previewCamera.lookAt(0, 0, 0);
+
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     this.renderer.setSize(canvas.clientWidth, canvas.clientHeight);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -157,28 +190,47 @@ export class CornholeGame {
 
     // Materials
     const groundMat = new CANNON.Material('ground');
-    const bagMat = new CANNON.Material('bag');
     const boardMat = new CANNON.Material('board');
+    this.stickyBagMaterial = new CANNON.Material('sticky-bag');
+    this.slickBagMaterial = new CANNON.Material('slick-bag');
 
-    this.world.addContactMaterial(new CANNON.ContactMaterial(bagMat, groundMat, {
-      friction: 1.0,
-      restitution: 0.08,
+    this.world.addContactMaterial(new CANNON.ContactMaterial(this.stickyBagMaterial, groundMat, {
+      friction: 1.25,
+      restitution: 0.005,
     }));
-    this.world.addContactMaterial(new CANNON.ContactMaterial(bagMat, boardMat, {
-      friction: 0.7,
-      restitution: 0.12,
+    this.world.addContactMaterial(new CANNON.ContactMaterial(this.stickyBagMaterial, boardMat, {
+      friction: 1.1,
+      restitution: 0.008,
     }));
-    this.world.addContactMaterial(new CANNON.ContactMaterial(bagMat, bagMat, {
+    this.world.addContactMaterial(new CANNON.ContactMaterial(this.slickBagMaterial, groundMat, {
+      friction: 0.08,
+      restitution: 0.004,
+    }));
+    this.world.addContactMaterial(new CANNON.ContactMaterial(this.slickBagMaterial, boardMat, {
+      friction: 0.03,
+      restitution: 0.006,
+    }));
+    this.world.addContactMaterial(new CANNON.ContactMaterial(this.stickyBagMaterial, this.stickyBagMaterial, {
       friction: 0.8,
-      restitution: 0.05,
+      restitution: 0.01,
+    }));
+    this.world.addContactMaterial(new CANNON.ContactMaterial(this.slickBagMaterial, this.slickBagMaterial, {
+      friction: 0.45,
+      restitution: 0.012,
+    }));
+    this.world.addContactMaterial(new CANNON.ContactMaterial(this.stickyBagMaterial, this.slickBagMaterial, {
+      friction: 0.58,
+      restitution: 0.01,
     }));
 
     this.createLights();
     this.createGround(groundMat);
     this.createBoard(boardMat);
-    this.createBags(bagMat);
+    this.createBags(this.stickyBagMaterial);
     this.createEnvironment();
     this.createPullLine();
+    this.createBagPreview();
+    this.startTurn(1);
 
     window.addEventListener('resize', this.handleResize);
     this.installTestingHooks();
@@ -373,16 +425,10 @@ export class CornholeGame {
     const bagColors = [0xCC2222, 0xCC2222, 0xCC2222, 0xCC2222, 0x2244CC, 0x2244CC, 0x2244CC, 0x2244CC];
 
     for (let i = 0; i < 8; i++) {
-      // Visual - soft bag shape
       const geo = this.createBagGeometry();
-      const tex = this.createFabricTexture(bagColors[i]);
-      const visMat = new THREE.MeshStandardMaterial({
-        map: tex,
-        roughness: 0.9,
-        metalness: 0.0,
-      });
+      const materials = this.createBagMeshMaterials(bagColors[i]);
 
-      const mesh = new THREE.Mesh(geo, visMat);
+      const mesh = new THREE.Mesh(geo, materials);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       mesh.visible = false;
@@ -400,6 +446,67 @@ export class CornholeGame {
       body.position.set(0, -20, 0);
       this.world.addBody(body);
       this.bagBodies.push(body);
+    }
+  }
+
+  createBagMeshMaterials(teamColor: number): THREE.MeshStandardMaterial[] {
+    const edgeTex = this.createFabricTexture(teamColor);
+    const stickyTex = this.createBagFaceTexture(
+      this.shadeColor(teamColor, 0.18),
+      this.tintColor(teamColor, 0.35),
+      false
+    );
+    const slickTex = this.createBagFaceTexture(0x24455b, 0x79a8c7, true);
+
+    return [
+      new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
+      new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
+      new THREE.MeshStandardMaterial({ map: stickyTex, roughness: 0.96, metalness: 0.0 }),
+      new THREE.MeshStandardMaterial({ map: slickTex, roughness: 0.22, metalness: 0.16 }),
+      new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
+      new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
+    ];
+  }
+
+  createBagPreview() {
+    const ambient = new THREE.AmbientLight(0xffffff, 0.95);
+    this.previewScene.add(ambient);
+
+    const keyLight = new THREE.DirectionalLight(0xffffff, 1.5);
+    keyLight.position.set(2.2, 3.5, 3.2);
+    this.previewScene.add(keyLight);
+
+    const rimLight = new THREE.DirectionalLight(0xa8d8ff, 0.7);
+    rimLight.position.set(-2.5, 1.8, -1.5);
+    this.previewScene.add(rimLight);
+
+    const bag = new THREE.Mesh(
+      this.createBagGeometry(),
+      this.createBagMeshMaterials(0xcc2222)
+    );
+    bag.scale.setScalar(2.2);
+    bag.position.set(0, -0.04, 0);
+    this.previewScene.add(bag);
+    this.previewBag = bag;
+    this.updatePreviewBagMaterials();
+  }
+
+  updatePreviewBagMaterials() {
+    const previewPlayer = this.state.currentPlayer;
+    if (this.previewPlayer === previewPlayer && this.previewBag.material) return;
+
+    this.disposeBagMaterials(this.previewBag.material as THREE.Material | THREE.Material[]);
+    const teamColor = previewPlayer === 1 ? 0xcc2222 : 0x2244cc;
+    this.previewBag.material = this.createBagMeshMaterials(teamColor);
+    this.previewPlayer = previewPlayer;
+  }
+
+  disposeBagMaterials(material: THREE.Material | THREE.Material[]) {
+    const materials = Array.isArray(material) ? material : [material];
+    for (const mat of materials) {
+      const standardMat = mat as THREE.MeshStandardMaterial;
+      if (standardMat.map) standardMat.map.dispose();
+      standardMat.dispose();
     }
   }
 
@@ -440,6 +547,7 @@ export class CornholeGame {
     skyCtx.fillStyle = grad;
     skyCtx.fillRect(0, 0, 512, 512);
     const skyTex = new THREE.CanvasTexture(skyCanvas);
+    skyTex.wrapS = skyTex.wrapT = THREE.RepeatWrapping;
     const skyMat = new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide });
     this.scene.add(new THREE.Mesh(skyGeo, skyMat));
 
@@ -671,22 +779,105 @@ export class CornholeGame {
     return tex;
   }
 
+  tintColor(color: number, amount: number): number {
+    const r = (color >> 16) & 0xff;
+    const g = (color >> 8) & 0xff;
+    const b = color & 0xff;
+    const mix = (channel: number) => Math.max(0, Math.min(255, Math.round(channel + (255 - channel) * amount)));
+    return (mix(r) << 16) | (mix(g) << 8) | mix(b);
+  }
+
+  shadeColor(color: number, amount: number): number {
+    const r = (color >> 16) & 0xff;
+    const g = (color >> 8) & 0xff;
+    const b = color & 0xff;
+    const mix = (channel: number) => Math.max(0, Math.min(255, Math.round(channel * (1 - amount))));
+    return (mix(r) << 16) | (mix(g) << 8) | mix(b);
+  }
+
+  createBagFaceTexture(baseColor: number, accentColor: number, glossy: boolean): THREE.CanvasTexture {
+    const c = document.createElement('canvas');
+    c.width = 128;
+    c.height = 128;
+    const ctx = c.getContext('2d')!;
+    const base = `#${baseColor.toString(16).padStart(6, '0')}`;
+    const accent = `#${accentColor.toString(16).padStart(6, '0')}`;
+
+    ctx.fillStyle = base;
+    ctx.fillRect(0, 0, 128, 128);
+
+    if (glossy) {
+      for (let i = -32; i < 160; i += 18) {
+        ctx.strokeStyle = accent;
+        ctx.lineWidth = 6;
+        ctx.beginPath();
+        ctx.moveTo(i, 0);
+        ctx.lineTo(i + 40, 128);
+        ctx.stroke();
+      }
+      ctx.fillStyle = 'rgba(255,255,255,0.14)';
+      ctx.fillRect(10, 10, 108, 24);
+    } else {
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = 2;
+      for (let i = 12; i < 128; i += 12) {
+        ctx.beginPath();
+        ctx.moveTo(i, 12);
+        ctx.lineTo(i, 116);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(12, i);
+        ctx.lineTo(116, i);
+        ctx.stroke();
+      }
+    }
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(10, 10, 108, 108);
+
+    return new THREE.CanvasTexture(c);
+  }
+
   // ====== GAME LOGIC ======
+
+  startTurn(player: 1 | 2) {
+    this.state.currentPlayer = player;
+    this.state.turnIndicatorPlayer = player;
+    this.syncBagsLeftState();
+
+    if (this.state.bagsRemaining <= 0) {
+      this.currentTurnBagReady = false;
+      return;
+    }
+
+    this.selectedBagSide = this.playerBagSides[player];
+    this.state.selectedBagSide = this.selectedBagSide;
+    this.currentTurnBagReady = true;
+    this.state.message = `${player === 1 ? 'Player 1' : 'Player 2'}'s turn. Pull for distance, release to lock speed.`;
+  }
 
   throwBag() {
     if (this.state.isThrowing || this.state.isSettling || this.state.gameOver) return;
-    if (this.state.bagsRemaining <= 0) return;
+    if (!this.currentTurnBagReady) return;
+
+    const throwingPlayer = this.state.currentPlayer;
+    const idx = this.getBagIndexForCurrentPlayer();
+    this.decrementBagsLeft(this.state.currentPlayer);
+    this.currentTurnBagReady = false;
 
     this.state.isThrowing = true;
+    this.state.throwingPlayer = throwingPlayer;
     this.state.isAiming = false;
     this.state.isDragging = false;
     this.state.message = '';
     this.state.lastResult = '';
     this.state.lastPoints = 0;
+    // Immediately sync bags left so UI reflects the throw
+    this.syncBagsLeftState();
     this.emitState();
-
-    const idx = this.currentBagIndex;
-    this.currentBagIndex++;
+    this.bagSides[idx] = this.selectedBagSide;
 
     const body = this.bagBodies[idx];
     const mesh = this.bags[idx];
@@ -694,10 +885,17 @@ export class CornholeGame {
     const startX = this.playerX + this.aimX * 0.25;
     const startY = 1.5;
     const startZ = 12;
+    const speedT = THREE.MathUtils.clamp((this.aimPower - 0.35) / 0.65, 0, 1);
     body.position.set(startX, startY, startZ);
     body.velocity.set(0, 0, 0);
     body.angularVelocity.set(0, 0, 0);
-    body.quaternion.set(0, 0, 0, 1);
+    const sideFlip = this.selectedBagSide === 'sticky' ? Math.PI : 0;
+    const releasePitch = THREE.MathUtils.lerp(0.32, 0.12, speedT);
+    const releaseRoll = -this.aimX * 0.08;
+    body.quaternion.setFromEuler(sideFlip + releasePitch, 0, releaseRoll);
+    body.material = this.selectedBagSide === 'sticky' ? this.stickyBagMaterial : this.slickBagMaterial;
+    body.linearDamping = 0.4;
+    body.angularDamping = 0.6;
 
     mesh.visible = true;
     mesh.position.set(startX, startY, startZ);
@@ -709,29 +907,28 @@ export class CornholeGame {
     const dx = targetX - startX;
     const dz = targetZ - startZ;
 
-    const speedT = THREE.MathUtils.clamp((this.aimPower - 0.35) / 0.65, 0, 1);
-    const flightTime = THREE.MathUtils.lerp(0.52, 0.98, this.pullDistance);
-    const arcVy = THREE.MathUtils.lerp(5.4, 9.2, this.pullDistance);
-    const vy = THREE.MathUtils.lerp(arcVy, arcVy * 0.58, speedT);
+    const baseFlightTime = THREE.MathUtils.lerp(0.58, 1.02, this.pullDistance);
+    const flightTime = baseFlightTime * THREE.MathUtils.lerp(1.06, 0.72, speedT);
+    const arcVy = THREE.MathUtils.lerp(5.6, 9.4, this.pullDistance);
+    const vy = THREE.MathUtils.lerp(arcVy * 1.02, arcVy * 0.38, speedT);
     const vx = dx / flightTime + this.aimX * 0.35 + (Math.random() - 0.5) * 0.18;
     const vz = dz / flightTime;
 
     body.velocity.set(vx, vy, vz);
     body.angularVelocity.set(
-      (Math.random() - 0.5) * 8,
-      (Math.random() - 0.5) * 3,
-      (Math.random() - 0.5) * 8
+      THREE.MathUtils.lerp(-0.8, 0.8, Math.random()),
+      THREE.MathUtils.lerp(14, 32, speedT),
+      -this.aimX * 1.2 + THREE.MathUtils.lerp(-0.5, 0.5, Math.random())
     );
 
     this.settlingTimer = 0;
     this.bagSettled = false;
 
-    setTimeout(() => this.evaluateThrow(idx), 3500);
+    setTimeout(() => this.evaluateThrow(idx, throwingPlayer), 3500);
   }
 
-  evaluateThrow(bagIndex: number) {
+  evaluateThrow(bagIndex: number, throwingPlayer: 1 | 2) {
     const body = this.bagBodies[bagIndex];
-    // const mesh = this.bags[bagIndex]; // unused
 
     // Get bag world position
     const bagPos = new THREE.Vector3(body.position.x, body.position.y, body.position.z);
@@ -777,26 +974,28 @@ export class CornholeGame {
 
     this.state.lastPoints = points;
     this.state.lastResult = result;
-    this.state.bagsRemaining--;
+    // Use captured throwingPlayer — never stale
+    this.addScore(throwingPlayer, points);
     this.state.bagsThisInning++;
     this.state.isThrowing = false;
+    this.state.throwingPlayer = null;
+    this.currentTurnBagReady = false;
 
+    this.syncBagsLeftState();
     this.onScoreUpdate(points, result);
 
-    // Check if inning is over (8 bags total, 4 per player)
-    if (this.state.bagsThisInning >= 8) {
+    // Determine next player: alternate from whoever just threw
+    const nextPlayer: 1 | 2 = throwingPlayer === 1 ? 2 : 1;
+    if (this.getBagsLeft(1) <= 0 && this.getBagsLeft(2) <= 0) {
       this.endInning();
-    } else {
-      // Switch player every 4 bags
-      if (this.state.bagsThisInning % 4 === 0) {
-        this.state.currentPlayer = this.state.currentPlayer === 1 ? 2 : 1;
-        this.state.bagsRemaining = 4;
-        this.state.message = `${this.state.currentPlayer === 1 ? 'Player 1' : 'Player 2'}'s turn. Pull for distance, release to lock speed.`;
-      } else {
-        this.state.message = 'Pull for distance, release to lock speed.';
-      }
+    } else if (this.getBagsLeft(nextPlayer) > 0) {
+      this.startTurn(nextPlayer);
       this.state.isAiming = true;
-      this.state.message += ' — Aim and throw!';
+    } else if (this.getBagsLeft(throwingPlayer) > 0) {
+      this.startTurn(throwingPlayer);
+      this.state.isAiming = true;
+    } else {
+      this.endInning();
     }
 
     this.emitState();
@@ -809,8 +1008,9 @@ export class CornholeGame {
 
     this.state.inning++;
     this.state.bagsThisInning = 0;
-    this.state.bagsRemaining = 4; // reset for next player
-    this.state.currentPlayer = 1;
+    this.currentTurnBagReady = false;
+
+    this.syncBagsLeftState();
 
     // Check game over
     if (this.state.player1Score >= 21 || this.state.player2Score >= 21) {
@@ -838,7 +1038,12 @@ export class CornholeGame {
     this.state.isDragging = false;
     this.state.lastResult = '';
     this.state.lastPoints = 0;
-    this.state.bagsRemaining = 4;
+    // Reset bags thrown counters — this is the ONLY place they reset (new round)
+    this.playerBagsThrown[1] = 0;
+    this.playerBagsThrown[2] = 0;
+    this.state.player1RoundScore = 0;
+    this.state.player2RoundScore = 0;
+    this.currentTurnBagReady = false;
     this.aimX = 0;
     this.pullDistance = 0.3;
     this.aimPower = 0.65;
@@ -849,17 +1054,45 @@ export class CornholeGame {
       this.bagBodies[i].velocity.set(0, 0, 0);
       this.bagBodies[i].angularVelocity.set(0, 0, 0);
     }
-
-    this.currentBagIndex = 0;
+    this.bagInHole.fill(false);
+    this.startTurn(1);
     this.emitState();
   }
 
-  addScore(points: number) {
-    if (this.state.currentPlayer === 1) {
+  addScore(player: 1 | 2, points: number) {
+    if (player === 1) {
       this.state.player1Score += points;
+      this.state.player1RoundScore += points;
     } else {
       this.state.player2Score += points;
+      this.state.player2RoundScore += points;
     }
+  }
+
+  getBagsLeft(player: 1 | 2) {
+    return 4 - this.playerBagsThrown[player];
+  }
+
+  decrementBagsLeft(player: 1 | 2) {
+    this.playerBagsThrown[player] = Math.min(4, this.playerBagsThrown[player] + 1);
+  }
+
+  getNextPlayer(): 1 | 2 {
+    const otherPlayer = this.state.currentPlayer === 1 ? 2 : 1;
+    if (this.getBagsLeft(otherPlayer) > 0) {
+      return otherPlayer;
+    }
+    if (this.getBagsLeft(this.state.currentPlayer) > 0) {
+      return this.state.currentPlayer;
+    }
+    return otherPlayer;
+  }
+
+  getBagIndexForCurrentPlayer() {
+    if (this.state.currentPlayer === 1) {
+      return this.playerBagsThrown[1];
+    }
+    return 4 + this.playerBagsThrown[2];
   }
 
   // ====== PARTICLES ======
@@ -917,6 +1150,51 @@ export class CornholeGame {
       pos.needsUpdate = true;
       (ps.points.material as THREE.PointsMaterial).opacity = ps.life;
     }
+  }
+
+  updateBagSurfacePhysics(body: CANNON.Body) {
+    const boardTopY = this.boardGroup.position.y + 0.9;
+    const isNearLanding = body.position.y < boardTopY && Math.abs(body.velocity.y) < 5;
+
+    if (!isNearLanding) {
+      body.material = this.slickBagMaterial;
+      body.linearDamping = 0.4;
+      body.angularDamping = 0.6;
+      return;
+    }
+
+    const stickyWorldNormal = body.quaternion.vmult(this.stickyFaceNormal);
+    const stickyFaceDown = stickyWorldNormal.y < 0;
+
+    body.material = stickyFaceDown ? this.stickyBagMaterial : this.slickBagMaterial;
+    body.linearDamping = stickyFaceDown ? 0.82 : 0.03;
+    body.angularDamping = stickyFaceDown ? 0.88 : 0.08;
+  }
+
+  captureBagInHole(index: number) {
+    if (this.bagInHole[index]) return;
+
+    const body = this.bagBodies[index];
+    const boardWorldPos = new THREE.Vector3();
+    this.boardGroup.getWorldPosition(boardWorldPos);
+    const holeWorldPos = new THREE.Vector3(
+      boardWorldPos.x,
+      boardWorldPos.y + 0.08,
+      boardWorldPos.z + HOLE_Z * Math.cos(this.boardGroup.rotation.x)
+    );
+
+    const holeDist = Math.hypot(body.position.x - holeWorldPos.x, body.position.z - holeWorldPos.z);
+    const nearBoardTop = body.position.y < boardWorldPos.y + 0.55;
+    const movingSlowEnough = Math.abs(body.velocity.y) < 3.5;
+
+    if (!nearBoardTop || !movingSlowEnough || holeDist > HOLE_RADIUS * 0.78) return;
+
+    this.bagInHole[index] = true;
+    body.position.set(holeWorldPos.x, boardWorldPos.y - 0.55, holeWorldPos.z);
+    body.velocity.set(0, -0.5, 0);
+    body.angularVelocity.set(0, 0, 0);
+    body.linearDamping = 0.95;
+    body.angularDamping = 0.95;
   }
 
   // ====== INPUT ======
@@ -1004,6 +1282,12 @@ export class CornholeGame {
     } else if (event.code === 'ArrowRight') {
       this.moveRightPressed = true;
       event.preventDefault();
+    } else if (event.code === 'KeyF' && this.state.isAiming && !this.state.isThrowing && !this.state.gameOver) {
+      this.selectedBagSide = this.selectedBagSide === 'sticky' ? 'slick' : 'sticky';
+      this.playerBagSides[this.state.currentPlayer] = this.selectedBagSide;
+      this.state.selectedBagSide = this.selectedBagSide;
+      this.emitState();
+      event.preventDefault();
     }
   };
 
@@ -1025,12 +1309,19 @@ export class CornholeGame {
     this.updateBoardCameraFrustum();
   };
 
+  syncBagsLeftState() {
+    this.state.player1BagsLeft = 4 - this.playerBagsThrown[1];
+    this.state.player2BagsLeft = 4 - this.playerBagsThrown[2];
+    this.state.bagsRemaining = this.state.currentPlayer === 1
+      ? this.state.player1BagsLeft
+      : this.state.player2BagsLeft;
+  }
+
   emitState() {
-    if (this.state.lastPoints > 0 && !this.state.isThrowing) {
-      this.addScore(this.state.lastPoints);
-      this.state.lastPoints = 0;
-    }
+    // Do NOT overwrite player1BagsLeft / player2BagsLeft here —
+    // they are managed explicitly by throwBag, startTurn, evaluateThrow, resetBags.
     this.state.aimPower = this.aimPower;
+    this.state.selectedBagSide = this.selectedBagSide;
     this.state.dragStartX = (this.dragStart.x + 1) * 0.5;
     this.state.dragStartY = (1 - this.dragStart.y) * 0.5;
     this.state.dragCurrentX = (this.dragCurrent.x + 1) * 0.5;
@@ -1045,6 +1336,8 @@ export class CornholeGame {
     scores: {
       player1: this.state.player1Score,
       player2: this.state.player2Score,
+      player1Round: this.state.player1RoundScore,
+      player2Round: this.state.player2RoundScore,
     },
     throwState: {
       isAiming: this.state.isAiming,
@@ -1053,7 +1346,10 @@ export class CornholeGame {
       aimX: Number(this.aimX.toFixed(2)),
       pullDistance: Number(this.pullDistance.toFixed(2)),
       aimPower: Number(this.aimPower.toFixed(2)),
+      selectedBagSide: this.selectedBagSide,
       bagsRemaining: this.state.bagsRemaining,
+      player1BagsLeft: this.state.player1BagsLeft,
+      player2BagsLeft: this.state.player2BagsLeft,
       message: this.state.message,
       playerX: Number(this.playerX.toFixed(2)),
     },
@@ -1099,11 +1395,14 @@ export class CornholeGame {
       this.aimPower = cycle;
       this.emitState();
     }
+    this.updatePreviewBagMaterials();
     this.world.step(1 / 60, dt, 3);
 
     // Sync bag visuals
     for (let i = 0; i < this.bags.length; i++) {
       if (this.bags[i].visible) {
+        this.captureBagInHole(i);
+        this.updateBagSurfacePhysics(this.bagBodies[i]);
         this.bags[i].position.copy(this.bagBodies[i].position as any);
         this.bags[i].quaternion.copy(this.bagBodies[i].quaternion as any);
       }
@@ -1130,6 +1429,10 @@ export class CornholeGame {
 
     // Update particles
     this.updateParticles(dt);
+
+    const previewPitch = this.selectedBagSide === 'sticky' ? -0.48 : Math.PI - 0.48;
+    this.previewBag.rotation.set(previewPitch, this.totalTime * 0.7, -0.02);
+    this.previewBag.position.y = -0.04 + Math.sin(this.totalTime * 1.2) * 0.015;
   }
 
   render() {
@@ -1144,7 +1447,6 @@ export class CornholeGame {
     const insetHeight = Math.round(Math.min(432, height * 0.432));
     const insetX = 24;
     const insetY = Math.max(24, Math.round(height * 0.28));
-
     this.renderer.setViewport(0, 0, width, height);
     this.renderer.setScissorTest(false);
     this.renderer.clear();
@@ -1155,6 +1457,29 @@ export class CornholeGame {
     this.renderer.setScissor(insetX, height - insetY - insetHeight, insetWidth, insetHeight);
     this.renderer.setViewport(insetX, height - insetY - insetHeight, insetWidth, insetHeight);
     this.renderer.render(this.scene, this.boardCamera);
+
+    const previewElement = document.getElementById('bag-preview-viewport');
+    const canvasRect = canvas.getBoundingClientRect();
+    const previewRect = previewElement?.getBoundingClientRect();
+    if (previewRect) {
+      const previewViewportX = Math.round(previewRect.left - canvasRect.left);
+      const previewViewportY = Math.round(canvasRect.bottom - previewRect.bottom);
+      const previewViewportWidth = Math.round(previewRect.width);
+      const previewViewportHeight = Math.round(previewRect.height);
+      const previewAspect = previewViewportWidth / previewViewportHeight;
+      const previewVerticalSpan = 1.1;
+
+      this.previewCamera.left = -previewVerticalSpan * previewAspect;
+      this.previewCamera.right = previewVerticalSpan * previewAspect;
+      this.previewCamera.top = previewVerticalSpan;
+      this.previewCamera.bottom = -previewVerticalSpan;
+      this.previewCamera.updateProjectionMatrix();
+
+      this.renderer.clearDepth();
+      this.renderer.setScissor(previewViewportX, previewViewportY, previewViewportWidth, previewViewportHeight);
+      this.renderer.setViewport(previewViewportX, previewViewportY, previewViewportWidth, previewViewportHeight);
+      this.renderer.render(this.previewScene, this.previewCamera);
+    }
     this.renderer.setScissorTest(false);
   }
 
@@ -1202,6 +1527,10 @@ export class CornholeGame {
     canvas.removeEventListener('mouseleave', this.handleMouseLeave);
     delete window.render_game_to_text;
     delete window.advanceTime;
+    if (this.previewBag) {
+      this.previewBag.geometry.dispose();
+      this.disposeBagMaterials(this.previewBag.material as THREE.Material | THREE.Material[]);
+    }
     this.renderer.dispose();
   }
 
