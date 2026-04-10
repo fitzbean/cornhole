@@ -41,4 +41,17 @@ Original prompt: Change the throw mechanic to a slingshot type of mechanic where
 - Refined bag accounting so actual inventory only decrements once on throw resolution while the HUD keeps a stable one-bag reservation for the active player through aiming and flight, eliminating the throw-time add-back flicker.
 - Changed bag depletion timing again so counts now stay full during aiming and decrement exactly when the throw is released; the HUD once again shows raw per-player inventory directly from game state.
 - Reworked bag tracking around per-player "bags thrown this round" counters, with HUD bag counts derived from that source in `emitState()`, so counts only move downward after release and cannot refill mid-round.
+- Removed the `"Your Turn"` pill labels from both player HUD cards in `src/App.tsx`; the active turn is now indicated only by the existing card highlight treatment.
+- Softened sticky-side landings by lowering sticky board/ground friction and cutting sticky-only landing damping, so sticky bags check up sooner than slick but still slide a short distance.
+- Gave each player a separate default lateral throwing lane and restore that lane on turn start, so the aiming camera begins parallel to the board from each player's side instead of recentering on the middle.
+- Cleared the pullback guide immediately on mouse release/cancel by hiding the Three pull-line and resetting drag coordinates in the release handler instead of waiting for the next frame.
+- Restricted lateral movement so each player can only move farther outward from their own default lane, never back toward center or across to the other side.
+- Split the `Current Bag` HUD side from the internal selected throw side so the panel holds on the throwing player's bag face until the next turn actually starts, while still updating immediately if the active player flips with `F`.
+- Reworked scoring to recompute round totals from all visible bags after each settled throw, so previously-thrown bags that get knocked from the board into the hole upgrade from 1 point to 3 correctly.
+- Kept main scores frozen during the inning and moved the live round totals into small panels on either side of the center inning box; main scores now update only when `endInning()` commits the round.
+- Updated the center scoreboard copy so the middle label reads `Round` and each side mini-box label reads `Score`.
+- Fixed the round-end modal timing by tracking and clearing the pending reset timeout, preventing stale timers from closing a new modal immediately; game-over no longer auto-resets after 3 seconds.
+- Simplified round scoring to a per-bag points model: each thrown bag stores its current point value, those values are recomputed from live bag positions after each settled throw, and each player's round total is the sum of their four bag point values.
+- Added an explicit `syncRoundScoresFromBagPoints()` call in `throwBag()` so the round totals shown during flight are always derived from the existing per-bag point values and do not snap to zero on release.
+- Actual root-cause fix for the snap-to-zero bug: React `StrictMode` was leaving a disposed `CornholeGame` RAF loop alive, and that stale instance could still emit zero-score state during flight. Added `isDisposed` / `animationFrameId` guards so disposed games stop emitting and stop their animation loop.
 - TODO: Run build and browser checks, inspect screenshot/text output, and tune drag sensitivity if the throw feels off.
