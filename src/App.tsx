@@ -31,6 +31,7 @@ const initialGameState: GameState = {
   lastPoints: 0,
   lastResult: '',
   aimPower: 0.65,
+  throwDistanceFeet: 0,
   selectedBagSide: 'sticky',
   bagPreviewSide: 'sticky',
   throwStyle: 'slide',
@@ -255,7 +256,10 @@ function App() {
           }}
         >
           <div className="min-w-[150px] rounded-2xl border border-white/15 bg-black/78 px-4 py-3 shadow-[0_16px_35px_rgba(0,0,0,0.45)] backdrop-blur-sm">
-            <div className="text-center text-[10px] font-bold uppercase tracking-[0.28em] text-white/55">Trajectory</div>
+            <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-[0.28em] text-white/55">
+              <span className="flex-1 text-center">Trajectory</span>
+              <span className="tabular-nums text-white/70">&nbsp;{Math.round(gameState.throwDistanceFeet)}ft</span>
+            </div>
             <div className="mt-2 h-2.5 overflow-hidden rounded-full bg-white/12">
               <div
                 className="h-full rounded-full transition-none"

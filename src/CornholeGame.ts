@@ -115,6 +115,7 @@ export interface GameState {
   lastPoints: number;
   lastResult: string;
   aimPower: number;
+  throwDistanceFeet: number;
   selectedBagSide: BagSide;
   bagPreviewSide: BagSide;
   throwStyle: ThrowStyle;
@@ -208,6 +209,7 @@ export class CornholeGame {
     lastPoints: 0,
     lastResult: '',
     aimPower: 0.65,
+    throwDistanceFeet: 0,
     selectedBagSide: 'sticky',
     bagPreviewSide: 'sticky',
     throwStyle: 'slide',
@@ -502,14 +504,17 @@ export class CornholeGame {
   }
 
   getTemperatureSpeedFactor() {
+    if (!this.weatherEnabled) return 1;
     return THREE.MathUtils.mapLinear(this.temperatureF, 48, 94, 0.96, 1.04);
   }
 
   getHumidityDragFactor() {
+    if (!this.weatherEnabled) return 1;
     return THREE.MathUtils.mapLinear(this.humidityPct, 34, 92, 0.96, 1.18);
   }
 
   getSurfaceDampingMultiplier() {
+    if (!this.weatherEnabled) return 1;
     const humidityFactor = THREE.MathUtils.mapLinear(this.humidityPct, 34, 92, 0.92, 1.24);
     const temperatureFactor = THREE.MathUtils.mapLinear(this.temperatureF, 48, 94, 1.08, 0.92);
     return THREE.MathUtils.clamp(humidityFactor * temperatureFactor, 0.84, 1.28);
@@ -2533,13 +2538,15 @@ export class CornholeGame {
     this.pullDistance = THREE.MathUtils.lerp(0.18, 1.0, easedPull);
 
     const rawPull = Math.max(downwardPull / 0.55, dragDistance / 0.85);
-    const throwFeet = rawPull * 30 * 2;
+    const throwFeet = rawPull * 74.5;
     this.state.message = `Throw distance: ${throwFeet.toFixed(1)} ft`;
+    this.state.throwDistanceFeet = throwFeet;
   }
 
   clearDragGuide() {
     this.dragCurrent.copy(this.dragStart);
     this.state.isDragging = false;
+    this.state.throwDistanceFeet = 0;
     this.pullLine.visible = false;
   }
 
