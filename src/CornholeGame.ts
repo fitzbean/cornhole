@@ -14,7 +14,7 @@ const SIDE_APRON_THICKNESS = 0.08;
 const REAR_LEG_LENGTH = 0.86;
 const REAR_LEG_THICKNESS = 0.22;
 const BAG_SIZE = 0.22;
-const BAG_MASS = 0.95;
+const BAG_MASS = 1.25;
 const PITCH_LENGTH = 27; // feet in real game, we use scaled units
 const GRAVITY = -9.81;
 const PLAYER_OUTER_X = 2.4;
@@ -32,9 +32,9 @@ const PLAYER_DEFAULT_X: Record<1 | 2, number> = {
 // ====== PHYSICS MATERIAL CONSTANTS ======
 const FRICTION = {
   STICKY_GROUND: 0.45,
-  STICKY_BOARD: 0.1,
+  STICKY_BOARD: 0.05,
   SLICK_GROUND: 0.1,
-  SLICK_BOARD: 0.01,
+  SLICK_BOARD: 0.025,
   SETTLED_GROUND: 0.06,
   SETTLED_BOARD: 0.018,
   STICKY_STICKY: 0.48,
@@ -141,6 +141,7 @@ export class CornholeGame {
   hemisphereLight!: THREE.HemisphereLight;
   sunLight!: THREE.DirectionalLight;
   fillLight!: THREE.DirectionalLight;
+  skyMaterial?: THREE.MeshBasicMaterial;
   stickyBagMaterial!: CANNON.Material;
   slickBagMaterial!: CANNON.Material;
   settledBagMaterial!: CANNON.Material;
@@ -167,6 +168,8 @@ export class CornholeGame {
   pullLine!: THREE.Line;
   trailPoints: THREE.Vector3[] = [];
   trailLine!: THREE.Line;
+  clouds: THREE.Group[] = [];
+  cloudShadows: THREE.Mesh[] = [];
   bagVisualStates: BagVisualState[] = [];
   bagRestPosePositions: Float32Array[] = [];
   bagVisualWorldPos = new THREE.Vector3();
@@ -432,7 +435,7 @@ export class CornholeGame {
     this.hemisphereLight.intensity = THREE.MathUtils.lerp(0.35, 0.9, sunHeight);
 
     this.sunLight.color.copy(sunColor);
-    this.sunLight.intensity = THREE.MathUtils.lerp(0.75, 2.0, sunHeight);
+    this.sunLight.intensity = THREE.MathUtils.lerp(0.75, 1.5, sunHeight);
     this.sunLight.position.set(
       THREE.MathUtils.lerp(-18, 18, dayProgress),
       THREE.MathUtils.lerp(7, 28, sunHeight),
@@ -448,6 +451,25 @@ export class CornholeGame {
       THREE.MathUtils.lerp(6, 12, sunHeight),
       THREE.MathUtils.lerp(-12, -4, dayProgress)
     );
+
+    this.updateSkyTint();
+  }
+
+  // Tints the static blue sky dome toward warm dawn/dusk tones so late-afternoon
+  // games don't look midday-blue. The dome texture is a static gradient, so we
+  // multiply it via the material's color.
+  updateSkyTint() {
+    if (!this.skyMaterial) return;
+    const dayProgress = THREE.MathUtils.clamp((this.timeOfDay - DAWN_TIME) / (DUSK_TIME - DAWN_TIME), 0, 1);
+    const sunHeight = Math.sin(dayProgress * Math.PI);
+    // Warm tint at horizon end of the day, neutral at midday.
+    // Evening side (dayProgress > 0.5) gets a stronger orange pull than dawn.
+    const isEvening = dayProgress > 0.5;
+    const warmColor = new THREE.Color(isEvening ? 0xFFB07A : 0xFFC49A);
+    const neutralColor = new THREE.Color(0xFFFFFF);
+    const warmth = Math.pow(1 - sunHeight, 1.4);
+    const tint = new THREE.Color().lerpColors(neutralColor, warmColor, warmth);
+    this.skyMaterial.color.copy(tint);
   }
 
   rollEnvironment() {
@@ -510,8 +532,9 @@ export class CornholeGame {
     const grassTex = this.createGrassTexture();
     const grassMat = new THREE.MeshStandardMaterial({
       map: grassTex,
-      roughness: 0.95,
-      metalness: 0.0,
+      color: 0xccddc8,
+      roughness: 0.85,
+      metalness: 0.05,
     });
     const grass = new THREE.Mesh(grassGeo, grassMat);
     grass.rotation.x = -Math.PI / 2;
@@ -522,8 +545,11 @@ export class CornholeGame {
     // Pitch (dirt path)
     const pitchGeo = new THREE.PlaneGeometry(5, PITCH_LENGTH + 5);
     const pitchTex = this.createDirtTexture();
+    const pitchAlphaMap = this.createPitchAlphaMap();
     const pitchMat = new THREE.MeshStandardMaterial({
       map: pitchTex,
+      alphaMap: pitchAlphaMap,
+      transparent: true,
       roughness: 1.0,
       metalness: 0.0,
     });
@@ -534,12 +560,12 @@ export class CornholeGame {
     this.scene.add(pitch);
 
     // Foul line
-    const lineLength = 14;
+    const lineLength = 18;
     const lineGeo = new THREE.PlaneGeometry(0.11, lineLength);
-    const lineMat = new THREE.MeshBasicMaterial({ color: 0x98937a, transparent: true, opacity: 0.24 });
+    const lineMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.24 });
     const line = new THREE.Mesh(lineGeo, lineMat);
     line.rotation.x = -Math.PI / 2;
-    line.position.set(0, 0.006, 7.25 - lineLength / 2);
+    line.position.set(0, 0.006, 10.25 - lineLength / 2);
     this.scene.add(line);
 
     // Physics ground
@@ -691,6 +717,50 @@ export class CornholeGame {
     this.world.addBody(this.boardBody);
   }
 
+  // Zero out the outward-normal velocity component when a bag contacts the
+  // board's front face, so it drops instead of bouncing back toward the thrower.
+  // Why: the front face is near-vertical; even with tiny restitution the solver
+  // redirects incoming horizontal momentum into a visible rebound.
+  suppressFrontEdgeBounce() {
+    // Front-face outward normal in world space (board rotated +BOARD_TILT about X).
+    const frontNx = 0;
+    const frontNy = -Math.sin(BOARD_TILT);
+    const frontNz = Math.cos(BOARD_TILT);
+
+    const contacts = this.world.contacts;
+    for (let c = 0; c < contacts.length; c++) {
+      const eq = contacts[c];
+      let bag: CANNON.Body | null = null;
+      let normalSign = 1;
+      if (eq.bi === this.boardBody && this.bagBodies.includes(eq.bj)) {
+        bag = eq.bj;
+        normalSign = 1; // ni points from boardBody (bi) to bag (bj) — outward from board
+      } else if (eq.bj === this.boardBody && this.bagBodies.includes(eq.bi)) {
+        bag = eq.bi;
+        normalSign = -1; // ni points from bag (bi) to board (bj) — flip to get outward-from-board
+      } else {
+        continue;
+      }
+
+      const nx = eq.ni.x * normalSign;
+      const ny = eq.ni.y * normalSign;
+      const nz = eq.ni.z * normalSign;
+
+      // Dot with front-face outward normal; require strong alignment so we
+      // don't affect top-surface or hole-edge contacts.
+      const alignment = nx * frontNx + ny * frontNy + nz * frontNz;
+      if (alignment < 0.7) continue;
+
+      const v = bag.velocity;
+      const vn = v.x * nx + v.y * ny + v.z * nz;
+      if (vn <= 0) continue; // already moving into the board, nothing to cancel
+
+      v.x -= vn * nx;
+      v.y -= vn * ny;
+      v.z -= vn * nz;
+    }
+  }
+
   createBags(material: CANNON.Material) {
     // 4 red (player 1), 4 blue (player 2)
     const bagColors = [0xCC2222, 0xCC2222, 0xCC2222, 0xCC2222, 0x2244CC, 0x2244CC, 0x2244CC, 0x2244CC];
@@ -712,8 +782,8 @@ export class CornholeGame {
         mass: BAG_MASS,
         material,
         shape: new CANNON.Box(new CANNON.Vec3(BAG_SIZE, BAG_SIZE * 0.26, BAG_SIZE)),
-        linearDamping: 0.4,
-        angularDamping: 0.6,
+        linearDamping: 0.55,
+        angularDamping: 0.75,
       });
       body.position.set(0, -20, 0);
       this.world.addBody(body);
@@ -890,27 +960,106 @@ export class CornholeGame {
     skyCanvas.height = 512;
     const skyCtx = skyCanvas.getContext('2d')!;
     const grad = skyCtx.createLinearGradient(0, 0, 0, 512);
-    grad.addColorStop(0, '#1a5faa');
-    grad.addColorStop(0.3, '#4a9ae0');
-    grad.addColorStop(0.6, '#87CEEB');
-    grad.addColorStop(1, '#c8e6f5');
+    grad.addColorStop(0, '#1a4a8a');
+    grad.addColorStop(0.3, '#2a7ad0');
+    grad.addColorStop(0.6, '#4a9aeb');
+    grad.addColorStop(1, '#8ac0f5');
     skyCtx.fillStyle = grad;
     skyCtx.fillRect(0, 0, 512, 512);
     const skyTex = new THREE.CanvasTexture(skyCanvas);
     skyTex.wrapS = skyTex.wrapT = THREE.RepeatWrapping;
     const skyMat = new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide });
+    this.skyMaterial = skyMat;
     this.scene.add(new THREE.Mesh(skyGeo, skyMat));
+    this.updateSkyTint();
 
-    // Clouds
-    for (let i = 0; i < 8; i++) {
-      const cloud = this.createCloud();
-      cloud.position.set(
-        (Math.random() - 0.5) * 60,
-        20 + Math.random() * 15,
-        -30 + Math.random() * 40
-      );
-      cloud.scale.setScalar(0.5 + Math.random() * 1.5);
-      this.scene.add(cloud);
+    // Cloud layers distributed in full-ring (polar) so they surround the play
+    // area rather than sitting only in front of the player. Clouds drift along
+    // +X at constant Z/Y; wrap bounds are wider than the visible horizon and
+    // paired with edge-fade so the loop isn't visible.
+    const cloudLayers: Array<{
+      count: number;
+      rMin: number;
+      rMax: number;
+      yMin: number;
+      yRange: number;
+      scaleMin: number;
+      scaleRange: number;
+      speedMin: number;
+      speedRange: number;
+      baseOpacity: number;
+      wrapX: number;
+      fadeMargin: number;
+    }> = [
+      // Overhead layer — flies above the play field so shadows fall on land
+      {
+        count: 10, rMin: 0, rMax: 30, yMin: 34, yRange: 10,
+        scaleMin: 1.4, scaleRange: 1.6, speedMin: 0.4, speedRange: 1.0,
+        baseOpacity: 0.92, wrapX: 85, fadeMargin: 18,
+      },
+      // Near layer — still well above the player, ringing the field
+      {
+        count: 28, rMin: 45, rMax: 70, yMin: 28, yRange: 16,
+        scaleMin: 1.5, scaleRange: 2, speedMin: 0.5, speedRange: 1.5,
+        baseOpacity: 0.95, wrapX: 90, fadeMargin: 20,
+      },
+      // Mid-far layer — higher and further
+      {
+        count: 22, rMin: 60, rMax: 82, yMin: 38, yRange: 14,
+        scaleMin: 0.8, scaleRange: 1, speedMin: 0.2, speedRange: 0.5,
+        baseOpacity: 0.9, wrapX: 100, fadeMargin: 22,
+      },
+      // Horizon layer — low, ringing the sky dome near its radius (~90)
+      {
+        count: 34, rMin: 70, rMax: 86, yMin: 6, yRange: 10,
+        scaleMin: 0.35, scaleRange: 0.45, speedMin: 0.05, speedRange: 0.15,
+        baseOpacity: 0.55, wrapX: 115, fadeMargin: 30,
+      },
+    ];
+
+    const shadowTex = this.createCloudShadowTexture();
+    const shadowGeo = new THREE.PlaneGeometry(1, 1);
+
+    for (const layer of cloudLayers) {
+      for (let i = 0; i < layer.count; i++) {
+        const cloud = this.createCloud();
+        const angle = Math.random() * Math.PI * 2;
+        const radius = layer.rMin + Math.random() * (layer.rMax - layer.rMin);
+        cloud.position.set(
+          Math.cos(angle) * radius,
+          layer.yMin + Math.random() * layer.yRange,
+          Math.sin(angle) * radius
+        );
+        const cloudScale = layer.scaleMin + Math.random() * layer.scaleRange;
+        cloud.scale.setScalar(cloudScale);
+        cloud.userData.speed = layer.speedMin + Math.random() * layer.speedRange;
+        cloud.userData.baseOpacity = layer.baseOpacity;
+        cloud.userData.wrapX = layer.wrapX;
+        cloud.userData.fadeMargin = layer.fadeMargin;
+        const mat = cloud.userData.material as THREE.MeshStandardMaterial;
+        mat.opacity = layer.baseOpacity;
+        this.scene.add(cloud);
+        this.clouds.push(cloud);
+
+        // Fake ground shadow disk — radius scales with cloud puff footprint.
+        // Real puff span is ~12 units across (6 puffs * 2.5 spacing); shadow
+        // reflects that, scaled by the cloud's overall scale.
+        const shadowMat = new THREE.MeshBasicMaterial({
+          map: shadowTex,
+          transparent: true,
+          opacity: 0.25,
+          depthWrite: false,
+          color: 0x000000,
+        });
+        const shadow = new THREE.Mesh(shadowGeo, shadowMat);
+        shadow.rotation.x = -Math.PI / 2;
+        shadow.scale.setScalar(14 * cloudScale);
+        shadow.position.set(cloud.position.x, 0.02, cloud.position.z);
+        shadow.renderOrder = 1;
+        shadow.userData.baseOpacity = 0.6 * layer.baseOpacity;
+        this.scene.add(shadow);
+        this.cloudShadows.push(shadow);
+      }
     }
 
     // Trees
@@ -1108,21 +1257,37 @@ export class CornholeGame {
     return group;
   }
 
+  // Soft-edged circular alpha texture used for fake cloud shadows on the ground.
+  createCloudShadowTexture(): THREE.CanvasTexture {
+    const size = 128;
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = size;
+    const ctx = canvas.getContext('2d')!;
+    const grad = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    grad.addColorStop(0, 'rgba(0,0,0,1)');
+    grad.addColorStop(0.55, 'rgba(0,0,0,0.55)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, size, size);
+    return new THREE.CanvasTexture(canvas);
+  }
+
   createCloud(): THREE.Group {
     const group = new THREE.Group();
     const cloudMat = new THREE.MeshStandardMaterial({
       color: 0xFFFFFF,
       roughness: 1,
       transparent: true,
-      opacity: 0.8,
+      opacity: 0.95,
     });
-    const puffGeo = new THREE.SphereGeometry(1, 8, 6);
-    for (let i = 0; i < 5; i++) {
+    const puffGeo = new THREE.SphereGeometry(2, 8, 6);
+    for (let i = 0; i < 6; i++) {
       const puff = new THREE.Mesh(puffGeo, cloudMat);
-      puff.position.set(i * 1.2 - 2.4, Math.random() * 0.5, Math.random() * 0.8);
-      puff.scale.set(0.8 + Math.random() * 0.5, 0.5 + Math.random() * 0.3, 0.6 + Math.random() * 0.4);
+      puff.position.set(i * 2.5 - 6, Math.random() * 1, Math.random() * 1.5);
+      puff.scale.set(0.8 + Math.random() * 0.6, 0.5 + Math.random() * 0.4, 0.6 + Math.random() * 0.5);
       group.add(puff);
     }
+    group.userData.material = cloudMat;
     return group;
   }
 
@@ -1209,18 +1374,115 @@ export class CornholeGame {
     c.width = 256;
     c.height = 256;
     const ctx = c.getContext('2d')!;
-    ctx.fillStyle = '#5a8a4a';
+
+    // Parse RGB color
+    const rgbMatch = 'rgb(97, 49, 4)'.match(/\d+/g);
+    const baseR = parseInt(rgbMatch![0]);
+    const baseG = parseInt(rgbMatch![1]);
+    const baseB = parseInt(rgbMatch![2]);
+
+    // Base color fill
+    ctx.fillStyle = `rgb(${baseR}, ${baseG}, ${baseB})`;
     ctx.fillRect(0, 0, 256, 256);
-    for (let i = 0; i < 5000; i++) {
+
+    // Add organic dirt texture with varied particle sizes and colors
+    for (let i = 0; i < 8000; i++) {
       const x = Math.random() * 256;
       const y = Math.random() * 256;
-      const s = Math.random() * 20 - 10;
-      ctx.fillStyle = `rgb(${90 + s},${138 + s},${74 + s})`;
-      ctx.fillRect(x, y, 2, 2);
+      const s = Math.random() * 30 - 15;
+      const size = 1 + Math.random() * 4;
+
+      const r = Math.max(0, Math.min(255, baseR + s + Math.random() * 1));
+      const g = Math.max(0, Math.min(255, baseG + s + Math.random() * 1));
+      const b = Math.max(0, Math.min(255, baseB + s + Math.random() * 1));
+
+      ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+
+      if (Math.random() > 0.5) {
+        ctx.fillRect(x, y, size, size);
+      } else {
+        ctx.beginPath();
+        ctx.arc(x, y, size / 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
+
+    // Add some larger pebbles/rocks
+    for (let i = 0; i < 200; i++) {
+      const x = Math.random() * 256;
+      const y = Math.random() * 256;
+      const size = 2 + Math.random() * 6;
+      const gray = 80 + Math.random() * 40;
+      ctx.fillStyle = `rgb(${gray}, ${gray - 20}, ${gray - 30})`;
+      ctx.beginPath();
+      ctx.arc(x, y, size / 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
     const tex = new THREE.CanvasTexture(c);
     tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
     tex.repeat.set(2, 12);
+    return tex;
+  }
+
+  createPitchAlphaMap(): THREE.CanvasTexture {
+    // Alpha map that fades the pitch edges with an irregular/organic border
+    const c = document.createElement('canvas');
+    c.width = 256;
+    c.height = 512;
+    const ctx = c.getContext('2d')!;
+
+    // Start fully transparent
+    ctx.fillStyle = 'black';
+    ctx.fillRect(0, 0, 256, 512);
+
+    // Draw opaque dirt area with irregular edges using many overlapping ellipses
+    ctx.fillStyle = 'white';
+
+    // Core solid region
+    ctx.beginPath();
+    ctx.ellipse(128, 256, 90, 230, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Add irregular blobs along the edge for organic border
+    for (let i = 0; i < 60; i++) {
+      const t = i / 60;
+      const y = 20 + t * 472;
+      const side = i % 2 === 0 ? 1 : -1;
+      const edgeX = 128 + side * (85 + Math.random() * 25);
+      const radius = 15 + Math.random() * 20;
+      ctx.beginPath();
+      ctx.arc(edgeX, y, radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Blur via feathered overlay - simulate soft edge by drawing gradient rings
+    const imgData = ctx.getImageData(0, 0, 256, 512);
+    const data = imgData.data;
+    // Simple blur pass by averaging with neighbors
+    const blurred = new Uint8ClampedArray(data);
+    const radius = 6;
+    for (let y = radius; y < 512 - radius; y++) {
+      for (let x = radius; x < 256 - radius; x++) {
+        let sum = 0;
+        let count = 0;
+        for (let dy = -radius; dy <= radius; dy += 2) {
+          for (let dx = -radius; dx <= radius; dx += 2) {
+            const idx = ((y + dy) * 256 + (x + dx)) * 4;
+            sum += data[idx];
+            count++;
+          }
+        }
+        const avg = sum / count;
+        const baseIdx = (y * 256 + x) * 4;
+        blurred[baseIdx] = avg;
+        blurred[baseIdx + 1] = avg;
+        blurred[baseIdx + 2] = avg;
+      }
+    }
+    ctx.putImageData(new ImageData(blurred, 256, 512), 0, 0);
+
+    const tex = new THREE.CanvasTexture(c);
     return tex;
   }
 
@@ -1385,20 +1647,18 @@ export class CornholeGame {
 
     this.throwStyle = this.playerThrowStyles[player];
     this.selectedBagSide = this.playerBagSides[player];
-    this.applyThrowStyleBagPreference(player);
+    this.applyThrowStyleBagPreference();
     this.state.selectedBagSide = this.selectedBagSide;
     this.state.bagPreviewSide = this.selectedBagSide;
     this.state.throwStyle = this.throwStyle;
     this.currentTurnBagReady = true;
-    this.state.message = `${player === 1 ? 'Player 1' : 'Player 2'}'s turn. Pull for distance, release to lock speed.`;
+    this.state.message = `${player === 1 ? 'Player 1' : 'Player 2'}'s turn. Pull back to set power / aim, release to throw.`;
   }
 
-  applyThrowStyleBagPreference(player: 1 | 2 = this.state.currentPlayer) {
-    if (this.throwStyle !== 'slide') return;
-    this.selectedBagSide = 'slick';
-    this.playerBagSides[player] = 'slick';
-    this.state.selectedBagSide = 'slick';
-    this.state.bagPreviewSide = 'slick';
+  applyThrowStyleBagPreference() {
+    // Bag side preference is now independent of throw style — players can
+    // choose any bag side with any throw style. This method is kept for
+    // API compatibility but no longer forces a side change.
   }
 
   setCinematicCameraEnabled(enabled: boolean) {
@@ -1839,21 +2099,26 @@ export class CornholeGame {
     body.linearDamping *= surfaceDampingMultiplier;
     body.angularDamping = isSticky ? 0.72 : 0.34;
 
-    // Prevent bag from standing on its side - apply a gentle, proportional tipping
-    // torque when the bag is resting on an edge. The torque MUST go to zero as the
-    // bag flattens, otherwise it overshoots and the bag flips end-over-end.
+    // Prevent bag from standing on its side. A real bean bag is a loose sack of
+    // corn — its center of mass shifts the moment it tilts, so it physically cannot
+    // balance on an edge. We model that by always applying a tipping torque
+    // whenever the bag is off-flat, regardless of whether it's "settled" — a bag
+    // leaning against another bag can jitter above any velocity threshold yet still
+    // needs to fall over.
     const bagUp = new CANNON.Vec3(0, 1, 0);
     const worldUp = body.quaternion.vmult(bagUp);
     const upDotY = Math.abs(worldUp.y);
-    const isSettled = horizontalSpeed < 0.8 && Math.abs(body.velocity.y) < 0.5;
-    // Engage as soon as the bag is meaningfully off-flat (within ~55° of flat is fine).
-    const tiltFactor = THREE.MathUtils.clamp((0.6 - upDotY) / 0.6, 0, 1);
-    if (isSettled && tiltFactor > 0) {
-      // Scale with tilt AND with how slow the bag already is (don't fight existing spin).
+    // Engage whenever the bag is meaningfully off-flat (within ~25° of flat is fine).
+    // tiltFactor goes 0→1 as |upDotY| drops from 0.9 (flat-ish) to 0 (on edge).
+    const tiltFactor = THREE.MathUtils.clamp((0.9 - upDotY) / 0.9, 0, 1);
+    if (tiltFactor > 0) {
+      // Don't fight large existing spin, but don't require near-zero either — a
+      // bag slowly toppling should keep getting a nudge.
       const angularSpeed = body.angularVelocity.length();
-      const motionScale = THREE.MathUtils.clamp(1 - angularSpeed / 2.5, 0, 1);
-      // 0.35 N·m max on a ~0.0077 kg·m² inertia = ~45 rad/s², a firm nudge, not a flip.
-      const tipStrength = 0.35 * tiltFactor * motionScale;
+      const motionScale = THREE.MathUtils.clamp(1 - angularSpeed / 4.5, 0, 1);
+      // Ramp strength with tilt² so nearly-flat bags get only a whisper but
+      // near-vertical bags get a firm shove toward flat.
+      const tipStrength = 0.55 * tiltFactor * tiltFactor * motionScale;
       const torqueAxis = new CANNON.Vec3(-worldUp.z, 0, worldUp.x);
       if (torqueAxis.length() > 0.01 && tipStrength > 0.001) {
         torqueAxis.normalize();
@@ -2688,6 +2953,59 @@ export class CornholeGame {
     const timeScale = this.slowMotionEnabled ? 0.25 : 1.0;
     dt *= timeScale;
     this.totalTime += dt;
+
+    // Move clouds and fade them near the wrap edges so the loop isn't visible.
+    // Sun direction for projecting cloud shadows onto the ground.
+    const dayProgress = THREE.MathUtils.clamp((this.timeOfDay - DAWN_TIME) / (DUSK_TIME - DAWN_TIME), 0, 1);
+    const sunHeight = Math.sin(dayProgress * Math.PI);
+    const sunX = THREE.MathUtils.lerp(-18, 18, dayProgress);
+    const sunY = THREE.MathUtils.lerp(7, 28, sunHeight);
+    const sunZ = THREE.MathUtils.lerp(18, 8, dayProgress);
+    const invSunY = sunY > 0.5 ? 1 / sunY : 0;
+
+    for (let i = 0; i < this.clouds.length; i++) {
+      const cloud = this.clouds[i];
+      const speed = cloud.userData.speed || 1;
+      const wrapX: number = cloud.userData.wrapX ?? 80;
+      const fadeMargin: number = cloud.userData.fadeMargin ?? 15;
+      const baseOpacity: number = cloud.userData.baseOpacity ?? 0.95;
+
+      cloud.position.x += speed * dt;
+      if (cloud.position.x > wrapX) {
+        cloud.position.x -= wrapX * 2;
+      }
+
+      const edgeDist = wrapX - Math.abs(cloud.position.x);
+      const fade = THREE.MathUtils.clamp(edgeDist / fadeMargin, 0, 1);
+      const mat = cloud.userData.material as THREE.MeshStandardMaterial | undefined;
+      if (mat) mat.opacity = baseOpacity * fade;
+
+      const shadow = this.cloudShadows[i];
+      if (shadow) {
+        // Project cloud onto ground along the sun direction:
+        // ground_xz = cloud_xz - (cloud_y / sun_y) * sun_xz
+        const t = cloud.position.y * invSunY;
+        const sx = cloud.position.x - sunX * t;
+        const sz = cloud.position.z - sunZ * t;
+        shadow.position.x = sx;
+        shadow.position.z = sz;
+
+        // Hide the shadow when it falls outside the grass plane
+        // (x in [-40, 40], z in [-40, 60]). Soft edge to avoid popping.
+        const shadowRadius = shadow.scale.x * 0.5;
+        const xOver = Math.max(0, Math.abs(sx) - 40 + shadowRadius);
+        const zOver = Math.max(0, Math.max(sz - 60, -40 - sz) + shadowRadius);
+        const landFade = THREE.MathUtils.clamp(1 - Math.max(xOver, zOver) / (shadowRadius * 2 + 4), 0, 1);
+
+        const shadowMat = shadow.material as THREE.MeshBasicMaterial;
+        const baseShadowOpacity: number = shadow.userData.baseOpacity ?? 0.25;
+        // Shadows dim when the sun is low (soft contrast at dusk/dawn) and
+        // disappear when the sun is below the horizon.
+        shadowMat.opacity = baseShadowOpacity * fade * landFade * THREE.MathUtils.smoothstep(sunHeight, 0.05, 0.4);
+        shadow.visible = shadowMat.opacity > 0.005;
+      }
+    }
+
     const moveInput = (this.moveRightPressed ? 1 : 0) - (this.moveLeftPressed ? 1 : 0);
     if (!this.freeRoamCameraEnabled && moveInput !== 0) {
       const currentPlayer = this.state.currentPlayer;
@@ -2703,6 +3021,8 @@ export class CornholeGame {
     }
     this.updatePreviewBagMaterials();
     this.world.step(1 / 60, dt, 3);
+
+    this.suppressFrontEdgeBounce();
 
     // Handle settling timer (game-time based, respects slow motion)
     if (this.state.isSettling && this.activeThrownBagIndex !== null) {
