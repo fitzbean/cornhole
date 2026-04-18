@@ -55,3 +55,7 @@ Original prompt: Change the throw mechanic to a slingshot type of mechanic where
 - Added an explicit `syncRoundScoresFromBagPoints()` call in `throwBag()` so the round totals shown during flight are always derived from the existing per-bag point values and do not snap to zero on release.
 - Actual root-cause fix for the snap-to-zero bug: React `StrictMode` was leaving a disposed `CornholeGame` RAF loop alive, and that stale instance could still emit zero-score state during flight. Added `isDisposed` / `animationFrameId` guards so disposed games stop emitting and stop their animation loop.
 - TODO: Run build and browser checks, inspect screenshot/text output, and tune drag sensitivity if the throw feels off.
+- Added hold-to-inspect hole camera on C with mouse-look, team-colored slick faces, drag-origin speed bubble, and slide-style auto-switch to slick side.
+- Build validation rerun through local Vite entrypoint because PowerShell blocks npm.ps1 on this machine.
+- TypeScript API verification passed after the gameplay/UI updates.
+- Full Vite build/browser verification remains unconfirmed in this run because subprocess-based tooling is blocked in sandbox and elevation was declined.
