@@ -2531,6 +2531,10 @@ export class CornholeGame {
 
     this.aimX = THREE.MathUtils.clamp(launchVector.x * 2.1, -1.5, 1.5);
     this.pullDistance = THREE.MathUtils.lerp(0.18, 1.0, easedPull);
+
+    const rawPull = Math.max(downwardPull / 0.55, dragDistance / 0.85);
+    const throwFeet = rawPull * 30 * 2;
+    this.state.message = `Throw distance: ${throwFeet.toFixed(1)} ft`;
   }
 
   clearDragGuide() {

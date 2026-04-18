@@ -177,7 +177,7 @@ function App() {
     : gameState.isThrowing
       ? 'Bag in flight...'
       : gameState.isAiming
-        ? `${currentPlayerLabel}'s turn`
+        ? (gameState.isDragging ? gameState.message : `${currentPlayerLabel}'s turn`)
         : gameState.message;
   const player1CardClass = scoreHighlightPlayer === 1
     ? 'border-yellow-300 bg-red-950/75 shadow-[0_0_24px_rgba(250,204,21,0.55),0_0_50px_rgba(239,68,68,0.28)] scale-110'
