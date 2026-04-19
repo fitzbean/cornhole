@@ -238,6 +238,7 @@ export class CornholeGame {
   playerBagsThrown: Record<1 | 2, number> = { 1: 0, 2: 0 };
   inningBaseScores: Record<1 | 2, number> = { 1: 0, 2: 0 };
   cumulativeRoundPoints: Record<1 | 2, number> = { 1: 0, 2: 0 };
+  nextInningStarter: 1 | 2 = 1;
   animationFrameId: number | null = null;
   isDisposed = false;
   currentTurnBagReady = false;
@@ -259,6 +260,14 @@ export class CornholeGame {
   cinematicCameraEnabled = false;
   activeThrownBagIndex: number | null = null;
   slowMotionEnabled = false;
+
+  // Multiplayer
+  guestMode = false;
+  onlineHostMode = false;
+  localPlayerSlot: 1 | 2 = 1;
+  snapshotSeq = 0;
+  onSnapshot: ((snapshot: import('./net/types').Snapshot) => void) | null = null;
+  onLocalIntent: ((intent: import('./net/types').Intent) => void) | null = null;
 
   // Callbacks
   onStateChange: (state: GameState) => void;
@@ -503,6 +512,17 @@ export class CornholeGame {
     return `${hours}:${minutes.toString().padStart(2, '0')} ${suffix}`;
   }
 
+  // Weather effects on throws (all gated by weatherEnabled):
+  //   Temperature — multiplies launch speed via getTemperatureSpeedFactor().
+  //     48°F → 0.96x (cold air is denser, bags feel slower),
+  //     94°F → 1.04x (hot air is thinner).
+  //     Range is intentionally narrow (±4%) so temp is a subtle trim, not a dominant factor.
+  //   Humidity — divides launch speed via getHumidityDragFactor() (higher humidity = more drag).
+  //     34% → 0.98x drag, 92% → 1.08x drag. Kept subtle so wind dominates the "weather feel."
+  //     Also scales post-landing friction via getSurfaceDampingMultiplier() (damp surface grips more).
+  //   Wind — applied every physics tick to in-flight bags via applyWeatherWindToBag().
+  //     Tailwind/headwind (along ±Z, the throw axis) dominates: boosts or shortens distance.
+  //     Crosswind (along ±X) pushes the bag sideways, affecting aim.
   getTemperatureSpeedFactor() {
     if (!this.weatherEnabled) return 1;
     return THREE.MathUtils.mapLinear(this.temperatureF, 48, 94, 0.96, 1.04);
@@ -510,7 +530,7 @@ export class CornholeGame {
 
   getHumidityDragFactor() {
     if (!this.weatherEnabled) return 1;
-    return THREE.MathUtils.mapLinear(this.humidityPct, 34, 92, 0.96, 1.18);
+    return THREE.MathUtils.mapLinear(this.humidityPct, 34, 92, 0.98, 1.08);
   }
 
   getSurfaceDampingMultiplier() {
@@ -526,9 +546,11 @@ export class CornholeGame {
     const inFlight = body.position.y > boardTopY || Math.abs(body.velocity.y) > 1.1;
     if (!inFlight) return;
 
+    // Along-axis wind (Z) is weighted more heavily than crosswind (X) so tailwind/headwind
+    // has enough authority to overcome the humidity drag penalty on launch speed.
     const windStrength = this.windMph / 12;
-    body.velocity.x += this.windVector.x * windStrength * dt * 1.2;
-    body.velocity.z += this.windVector.z * windStrength * dt * 0.48;
+    body.velocity.x += this.windVector.x * windStrength * dt * 1.8;
+    body.velocity.z += this.windVector.z * windStrength * dt * 2.4;
   }
 
   createGround(material: CANNON.Material) {
@@ -818,7 +840,7 @@ export class CornholeGame {
       new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
       new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
       new THREE.MeshStandardMaterial({ map: stickyTex, roughness: 0.96, metalness: 0.0 }),
-      new THREE.MeshStandardMaterial({ map: slickTex, roughness: 0.22, metalness: 0.16 }),
+      new THREE.MeshStandardMaterial({ map: slickTex, roughness: 0.82, metalness: 0.0 }),
       new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
       new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
     ];
@@ -1748,6 +1770,7 @@ export class CornholeGame {
       vy * launchSpeedScale,
       vz * launchSpeedScale + this.windVector.z * windLaunchDrift * 0.45
     );
+
     if (isRollThrow) {
       const rollSpinAxis = body.quaternion.vmult(new CANNON.Vec3(0, 1, 0));
       const rollSpinSpeed = THREE.MathUtils.lerp(10, 15, speedT);
@@ -1859,6 +1882,18 @@ export class CornholeGame {
     this.state.bagsThisInning = 0;
     this.currentTurnBagReady = false;
 
+    // "Honor" — in online play, whoever scored points this inning starts the next one.
+    // Ties preserve the current starter. Keeps hot-seat play unchanged (starter stays P1).
+    if (this.onlineHostMode || this.guestMode) {
+      if (canceledRoundScores.player1 > canceledRoundScores.player2) {
+        this.nextInningStarter = 1;
+      } else if (canceledRoundScores.player2 > canceledRoundScores.player1) {
+        this.nextInningStarter = 2;
+      }
+    } else {
+      this.nextInningStarter = 1;
+    }
+
     this.syncBagsLeftState();
 
     // Check game over
@@ -1918,7 +1953,7 @@ export class CornholeGame {
     this.bagInHoleDetectedAt.fill(0);
     this.bagPendingHoleCleanup.fill(false);
     this.bagHoleCleanupReadyAt.fill(0);
-    this.startTurn(1);
+    this.startTurn(this.nextInningStarter);
     this.emitState();
   }
 
@@ -2078,7 +2113,7 @@ export class CornholeGame {
 
     if (!isNearLanding) {
       body.material = this.slickBagMaterial;
-      body.linearDamping = 0.4 * THREE.MathUtils.clamp(surfaceDampingMultiplier, 0.92, 1.1);
+      body.linearDamping = 0.4;
       body.angularDamping = 0.6;
       return;
     }
@@ -2539,7 +2574,8 @@ export class CornholeGame {
 
     const rawPull = Math.max(downwardPull / 0.55, dragDistance / 0.85);
     const throwFeet = rawPull * 74.5;
-    this.state.message = `Throw distance: ${throwFeet.toFixed(1)} ft`;
+    const throwPercentage = Math.min((throwFeet / 30) * 100, 500);
+    this.state.message = `Throw power: ${throwPercentage.toFixed(0)}%`;
     this.state.throwDistanceFeet = throwFeet;
   }
 
@@ -2696,6 +2732,14 @@ export class CornholeGame {
       return;
     }
 
+    if (this.guestMode) {
+      if (!this.isDragging) return;
+      const ndc = this.getPointerNdc(event);
+      this.dragCurrent.copy(ndc);
+      this.onLocalIntent?.({ type: 'dragMove', ndcX: ndc.x, ndcY: ndc.y });
+      return;
+    }
+
     if (!this.state.isAiming || !this.isDragging) return;
     this.dragCurrent.copy(this.getPointerNdc(event));
     this.updateAimFromDrag();
@@ -2711,7 +2755,19 @@ export class CornholeGame {
       return;
     }
 
+    if (this.guestMode) {
+      if (this.localPlayerSlot !== this.state.currentPlayer) return;
+      if (!this.state.isAiming || this.state.isThrowing || this.state.gameOver) return;
+      const ndc = this.getPointerNdc(event);
+      this.isDragging = true;
+      this.dragStart.copy(ndc);
+      this.dragCurrent.copy(ndc);
+      this.onLocalIntent?.({ type: 'dragStart', ndcX: ndc.x, ndcY: ndc.y });
+      return;
+    }
+
     if (!this.state.isAiming || this.state.isThrowing || this.state.gameOver) return;
+    if (!this.ownsCurrentTurn()) return;
     this.isDragging = true;
     this.state.isDragging = true;
     this.dragStart.copy(this.getPointerNdc(event));
@@ -2733,6 +2789,15 @@ export class CornholeGame {
     }
 
     if (!this.isDragging) return;
+
+    if (this.guestMode) {
+      const ndc = this.getPointerNdc(event);
+      this.dragCurrent.copy(ndc);
+      this.isDragging = false;
+      this.onLocalIntent?.({ type: 'dragEnd', ndcX: ndc.x, ndcY: ndc.y });
+      return;
+    }
+
     this.dragCurrent.copy(this.getPointerNdc(event));
     this.updateAimFromDrag();
     const dragDistance = this.getCurrentDragDistance();
@@ -2759,6 +2824,13 @@ export class CornholeGame {
     }
 
     if (!this.isDragging) return;
+
+    if (this.guestMode) {
+      this.isDragging = false;
+      this.onLocalIntent?.({ type: 'dragCancel' });
+      return;
+    }
+
     this.isDragging = false;
     this.clearDragGuide();
     this.state.message = 'Pull for distance, release to lock speed.';
@@ -2779,16 +2851,50 @@ export class CornholeGame {
   };
 
   handleKeyDown = (event: KeyboardEvent) => {
+    if (this.guestMode) {
+      if (event.code === 'ArrowLeft') {
+        this.onLocalIntent?.({ type: 'moveStart', direction: 'left' });
+        event.preventDefault();
+        return;
+      } else if (event.code === 'ArrowRight') {
+        this.onLocalIntent?.({ type: 'moveStart', direction: 'right' });
+        event.preventDefault();
+        return;
+      } else if (event.code === 'KeyF' && !event.repeat) {
+        this.onLocalIntent?.({ type: 'flipBagSide' });
+        event.preventDefault();
+        return;
+      } else if (event.code === 'KeyT' && !event.repeat) {
+        this.onLocalIntent?.({ type: 'toggleThrowStyle' });
+        event.preventDefault();
+        return;
+      } else if (event.code === 'KeyW' && !event.repeat) {
+        this.onLocalIntent?.({ type: 'toggleWeather' });
+        event.preventDefault();
+        return;
+      } else if (event.code === 'KeyC' && !event.repeat && !this.isDragging) {
+        this.inspectCameraHeld = true;
+        this.beginHoleInspection();
+        event.preventDefault();
+        return;
+      }
+      // Let other keys fall through for local camera controls.
+    }
+    const blockTurnInput = this.onlineHostMode && !this.ownsCurrentTurn();
     if (event.code === 'ArrowLeft') {
+      if (blockTurnInput) { event.preventDefault(); return; }
       this.moveLeftPressed = true;
       event.preventDefault();
     } else if (event.code === 'ArrowRight') {
+      if (blockTurnInput) { event.preventDefault(); return; }
       this.moveRightPressed = true;
       event.preventDefault();
     } else if (event.code === 'ArrowUp') {
+      if (blockTurnInput) { event.preventDefault(); return; }
       this.moveUpPressed = true;
       event.preventDefault();
     } else if (event.code === 'ArrowDown') {
+      if (blockTurnInput) { event.preventDefault(); return; }
       this.moveDownPressed = true;
       event.preventDefault();
     } else if (event.code === 'KeyC' && !event.repeat && !this.isDragging) {
@@ -2810,6 +2916,7 @@ export class CornholeGame {
       this.emitState();
       event.preventDefault();
     } else if (event.code === 'KeyF' && this.state.isAiming && !this.state.isThrowing && !this.state.gameOver) {
+      if (blockTurnInput) { event.preventDefault(); return; }
       this.selectedBagSide = this.selectedBagSide === 'sticky' ? 'slick' : 'sticky';
       this.playerBagSides[this.state.currentPlayer] = this.selectedBagSide;
       this.state.selectedBagSide = this.selectedBagSide;
@@ -2817,6 +2924,7 @@ export class CornholeGame {
       this.emitState();
       event.preventDefault();
     } else if (event.code === 'KeyT' && this.state.isAiming && !this.state.isThrowing && !this.state.gameOver) {
+      if (blockTurnInput) { event.preventDefault(); return; }
       this.throwStyle = this.throwStyle === 'slide' ? 'roll' : 'slide';
       this.playerThrowStyles[this.state.currentPlayer] = this.throwStyle;
       this.applyThrowStyleBagPreference();
@@ -2837,6 +2945,21 @@ export class CornholeGame {
   };
 
   handleKeyUp = (event: KeyboardEvent) => {
+    if (this.guestMode) {
+      if (event.code === 'ArrowLeft') {
+        this.onLocalIntent?.({ type: 'moveStop', direction: 'left' });
+        event.preventDefault();
+        return;
+      } else if (event.code === 'ArrowRight') {
+        this.onLocalIntent?.({ type: 'moveStop', direction: 'right' });
+        event.preventDefault();
+        return;
+      } else if (event.code === 'KeyC') {
+        this.inspectCameraHeld = false;
+        event.preventDefault();
+        return;
+      }
+    }
     if (event.code === 'ArrowLeft') {
       this.moveLeftPressed = false;
       event.preventDefault();
@@ -2899,6 +3022,9 @@ export class CornholeGame {
     this.state.dragCurrentX = (this.dragCurrent.x + 1) * 0.5;
     this.state.dragCurrentY = (1 - this.dragCurrent.y) * 0.5;
     this.onStateChange({ ...this.state });
+    if (!this.guestMode && this.onSnapshot) {
+      this.onSnapshot(this.serializeSnapshot());
+    }
   }
 
   renderGameToText = () => JSON.stringify({
@@ -3017,41 +3143,54 @@ export class CornholeGame {
       }
     }
 
-    const moveInput = (this.moveRightPressed ? 1 : 0) - (this.moveLeftPressed ? 1 : 0);
-    if (!this.freeRoamCameraEnabled && moveInput !== 0) {
-      const currentPlayer = this.state.currentPlayer;
-      const minX = currentPlayer === 1 ? -PLAYER_OUTER_X : PLAYER_DEFAULT_X[2];
-      const maxX = currentPlayer === 1 ? PLAYER_DEFAULT_X[1] : PLAYER_OUTER_X;
-      this.playerX = THREE.MathUtils.clamp(this.playerX + moveInput * dt * 2.8, minX, maxX);
-      this.playerPositions[this.state.currentPlayer] = this.playerX;
-    }
-    if (this.state.isAiming && !this.state.gameOver) {
-      const cycle = (Math.sin(this.totalTime * 3.8) + 1) * 0.5;
-      this.aimPower = cycle;
-      this.emitState();
+    if (!this.guestMode) {
+      const moveInput = (this.moveRightPressed ? 1 : 0) - (this.moveLeftPressed ? 1 : 0);
+      if (!this.freeRoamCameraEnabled && moveInput !== 0) {
+        const currentPlayer = this.state.currentPlayer;
+        const minX = currentPlayer === 1 ? -PLAYER_OUTER_X : PLAYER_DEFAULT_X[2];
+        const maxX = currentPlayer === 1 ? PLAYER_DEFAULT_X[1] : PLAYER_OUTER_X;
+        this.playerX = THREE.MathUtils.clamp(this.playerX + moveInput * dt * 2.8, minX, maxX);
+        this.playerPositions[this.state.currentPlayer] = this.playerX;
+      }
+      if (this.state.isAiming && !this.state.gameOver) {
+        const cycle = (Math.sin(this.totalTime * 3.8) + 1) * 0.5;
+        this.aimPower = cycle;
+        this.emitState();
+      }
     }
     this.updatePreviewBagMaterials();
-    this.world.step(1 / 60, dt, 3);
 
-    this.suppressFrontEdgeBounce();
+    if (!this.guestMode) {
+      this.world.step(1 / 60, dt, 3);
+      this.suppressFrontEdgeBounce();
 
-    // Handle settling timer (game-time based, respects slow motion)
-    if (this.state.isSettling && this.activeThrownBagIndex !== null) {
-      this.settlingTimer += dt;
-      if (this.settlingTimer >= 3.5) {
-        this.state.isSettling = false;
-        this.evaluateThrow(this.activeThrownBagIndex, this.state.throwingPlayer!);
+      // Handle settling timer (game-time based, respects slow motion)
+      if (this.state.isSettling && this.activeThrownBagIndex !== null) {
+        this.settlingTimer += dt;
+        if (this.settlingTimer >= 3.5) {
+          this.state.isSettling = false;
+          this.evaluateThrow(this.activeThrownBagIndex, this.state.throwingPlayer!);
+        }
+      }
+
+      // Broadcast snapshots during flight/settling so the guest can see the bag move.
+      // emitState only fires on state transitions — physics updates bodies every frame
+      // without touching state, so we emit a dedicated broadcast per-tick here.
+      if (this.onSnapshot && (this.state.isThrowing || this.state.isSettling)) {
+        this.onSnapshot(this.serializeSnapshot());
       }
     }
 
     // Sync bag visuals
     for (let i = 0; i < this.bags.length; i++) {
       if (this.bags[i].visible) {
-        this.captureBagInHole(i);
-        this.applyWeatherWindToBag(this.bagBodies[i], dt);
-        this.updateBagSurfacePhysics(this.bagBodies[i], i);
+        if (!this.guestMode) {
+          this.captureBagInHole(i);
+          this.applyWeatherWindToBag(this.bagBodies[i], dt);
+          this.updateBagSurfacePhysics(this.bagBodies[i], i);
+          this.finalizeBagInHole(i);
+        }
         this.applyBagVisualSoftness(i, dt);
-        this.finalizeBagInHole(i);
       }
     }
 
@@ -3191,5 +3330,221 @@ export class CornholeGame {
     canvas.addEventListener('mouseup', this.handleMouseUp);
     canvas.addEventListener('mouseleave', this.handleMouseLeave);
     canvas.addEventListener('wheel', this.handleWheel, { passive: false });
+  }
+
+  // ====== MULTIPLAYER ======
+
+  setGuestMode(enabled: boolean, localPlayerSlot: 1 | 2) {
+    this.guestMode = enabled;
+    this.onlineHostMode = false;
+    this.localPlayerSlot = localPlayerSlot;
+  }
+
+  setHostMode(localPlayerSlot: 1 | 2, online = false) {
+    this.guestMode = false;
+    this.onlineHostMode = online;
+    this.localPlayerSlot = localPlayerSlot;
+  }
+
+  // True when this client has any kind of multiplayer role and should refuse
+  // inputs for a player slot it doesn't own.
+  private isOnline(): boolean {
+    return this.guestMode || this.onlineHostMode;
+  }
+
+  private ownsCurrentTurn(): boolean {
+    if (!this.isOnline()) return true;
+    return this.localPlayerSlot === this.state.currentPlayer;
+  }
+
+  canLocalPlayerAct(): boolean {
+    if (this.guestMode) return false;
+    if (this.localPlayerSlot === this.state.currentPlayer) return true;
+    return false;
+  }
+
+  applyIntent(intent: import('./net/types').Intent, fromSlot: 1 | 2) {
+    if (this.guestMode) return;
+    if (fromSlot !== this.state.currentPlayer && intent.type !== 'toggleWeather' && intent.type !== 'resetCamera') {
+      return;
+    }
+    switch (intent.type) {
+      case 'moveStart':
+        if (intent.direction === 'left') this.moveLeftPressed = true;
+        else if (intent.direction === 'right') this.moveRightPressed = true;
+        else if (intent.direction === 'up') this.moveUpPressed = true;
+        else this.moveDownPressed = true;
+        break;
+      case 'moveStop':
+        if (intent.direction === 'left') this.moveLeftPressed = false;
+        else if (intent.direction === 'right') this.moveRightPressed = false;
+        else if (intent.direction === 'up') this.moveUpPressed = false;
+        else this.moveDownPressed = false;
+        break;
+      case 'dragStart':
+        if (!this.state.isAiming || this.state.isThrowing || this.state.gameOver) break;
+        this.isDragging = true;
+        this.state.isDragging = true;
+        this.dragStart.set(intent.ndcX, intent.ndcY);
+        this.dragCurrent.copy(this.dragStart);
+        this.aimX = 0;
+        this.pullDistance = 0.18;
+        this.state.lastResult = '';
+        this.state.lastPoints = 0;
+        this.state.message = 'Pull for distance, release to lock speed.';
+        this.emitState();
+        break;
+      case 'dragMove':
+        if (!this.state.isAiming || !this.isDragging) break;
+        this.dragCurrent.set(intent.ndcX, intent.ndcY);
+        this.updateAimFromDrag();
+        this.emitState();
+        break;
+      case 'dragEnd': {
+        if (!this.isDragging) break;
+        this.dragCurrent.set(intent.ndcX, intent.ndcY);
+        this.updateAimFromDrag();
+        const dragDistance = this.getCurrentDragDistance();
+        this.isDragging = false;
+        this.state.isDragging = false;
+        this.clearDragGuide();
+        const shouldThrow = dragDistance >= 0.08 && this.pullDistance > 0.2;
+        this.emitState();
+        if (shouldThrow) {
+          this.throwBag();
+        } else {
+          this.state.message = 'Pull farther for more distance.';
+          this.emitState();
+        }
+        break;
+      }
+      case 'dragCancel':
+        if (!this.isDragging) break;
+        this.isDragging = false;
+        this.state.isDragging = false;
+        this.clearDragGuide();
+        this.state.message = 'Pull for distance, release to lock speed.';
+        this.aimX = 0;
+        this.pullDistance = 0.3;
+        this.aimPower = 0.65;
+        this.emitState();
+        break;
+      case 'flipBagSide':
+        if (!this.state.isAiming || this.state.isThrowing || this.state.gameOver) break;
+        this.selectedBagSide = this.selectedBagSide === 'sticky' ? 'slick' : 'sticky';
+        this.playerBagSides[this.state.currentPlayer] = this.selectedBagSide;
+        this.state.selectedBagSide = this.selectedBagSide;
+        this.state.bagPreviewSide = this.selectedBagSide;
+        this.emitState();
+        break;
+      case 'toggleThrowStyle':
+        if (!this.state.isAiming || this.state.isThrowing || this.state.gameOver) break;
+        this.throwStyle = this.throwStyle === 'slide' ? 'roll' : 'slide';
+        this.playerThrowStyles[this.state.currentPlayer] = this.throwStyle;
+        this.applyThrowStyleBagPreference();
+        this.state.throwStyle = this.throwStyle;
+        this.state.message = `Throw style: ${this.throwStyle === 'slide' ? 'Slide' : 'Roll'}`;
+        this.emitState();
+        break;
+      case 'toggleWeather':
+        this.weatherEnabled = !this.weatherEnabled;
+        this.emitState();
+        break;
+      case 'resetCamera':
+        this.cameraPosition.copy(this.turnStartCameraPosition);
+        this.cameraLookTarget.copy(this.turnStartCameraLookTarget);
+        this.camera.position.copy(this.cameraPosition);
+        this.camera.lookAt(this.cameraLookTarget);
+        this.emitState();
+        break;
+      case 'setInspect':
+        this.inspectCameraHeld = intent.held;
+        if (intent.held) this.beginHoleInspection();
+        break;
+      case 'startGame':
+        break;
+    }
+  }
+
+  serializeSnapshot(): import('./net/types').Snapshot {
+    this.snapshotSeq++;
+    const bags: import('./net/types').BagSnapshot[] = [];
+    for (let i = 0; i < this.bags.length; i++) {
+      const mesh = this.bags[i];
+      const body = this.bagBodies[i];
+      if (!mesh || !body) continue;
+      if (!mesh.visible) continue;
+      bags.push({
+        index: i,
+        visible: true,
+        inHole: this.bagInHole[i],
+        side: this.bagSides[i],
+        throwStyle: this.bagThrowStyles[i],
+        x: body.position.x, y: body.position.y, z: body.position.z,
+        qx: body.quaternion.x, qy: body.quaternion.y,
+        qz: body.quaternion.z, qw: body.quaternion.w,
+      });
+    }
+    return {
+      state: { ...this.state },
+      bags,
+      playerX: this.playerX,
+      aimX: this.aimX,
+      pullDistance: this.pullDistance,
+      cameraPos: [this.cameraPosition.x, this.cameraPosition.y, this.cameraPosition.z],
+      cameraLook: [this.cameraLookTarget.x, this.cameraLookTarget.y, this.cameraLookTarget.z],
+      timeOfDay: this.timeOfDay,
+      seq: this.snapshotSeq,
+    };
+  }
+
+  applySnapshot(snapshot: import('./net/types').Snapshot) {
+    if (!this.guestMode) return;
+    if (snapshot.seq <= this.snapshotSeq) return;
+    this.snapshotSeq = snapshot.seq;
+
+    this.state = { ...snapshot.state };
+    this.playerX = snapshot.playerX;
+    this.aimX = snapshot.aimX;
+    this.pullDistance = snapshot.pullDistance;
+    this.aimPower = snapshot.state.aimPower;
+    this.selectedBagSide = snapshot.state.selectedBagSide;
+    this.throwStyle = snapshot.state.throwStyle;
+    this.weatherEnabled = snapshot.state.weatherEnabled;
+    const timeOfDayChanged = this.timeOfDay !== snapshot.timeOfDay;
+    this.timeOfDay = snapshot.timeOfDay;
+    this.temperatureF = snapshot.state.temperatureF;
+    this.windMph = snapshot.state.windMph;
+    this.windDirection = snapshot.state.windDirection;
+    this.humidityPct = snapshot.state.humidityPct;
+    if (timeOfDayChanged) {
+      this.applyTimeOfDayLighting();
+    }
+    this.dragStart.set(snapshot.state.dragStartX * 2 - 1, 1 - snapshot.state.dragStartY * 2);
+    this.dragCurrent.set(snapshot.state.dragCurrentX * 2 - 1, 1 - snapshot.state.dragCurrentY * 2);
+    this.isDragging = snapshot.state.isDragging;
+
+    // Hide all bags, then show/position only the ones in the snapshot.
+    for (let i = 0; i < this.bags.length; i++) {
+      if (this.bags[i]) this.bags[i].visible = false;
+      this.bagInHole[i] = false;
+    }
+    for (const bag of snapshot.bags) {
+      const mesh = this.bags[bag.index];
+      const body = this.bagBodies[bag.index];
+      if (!mesh || !body) continue;
+      mesh.visible = bag.visible;
+      this.bagInHole[bag.index] = bag.inHole;
+      this.bagSides[bag.index] = bag.side;
+      this.bagThrowStyles[bag.index] = bag.throwStyle;
+      body.position.set(bag.x, bag.y, bag.z);
+      body.quaternion.set(bag.qx, bag.qy, bag.qz, bag.qw);
+      mesh.position.copy(body.position as unknown as THREE.Vector3);
+      mesh.quaternion.copy(body.quaternion as unknown as THREE.Quaternion);
+      body.velocity.setZero();
+      body.angularVelocity.setZero();
+      body.sleep();
+    }
+    this.emitState();
   }
 }

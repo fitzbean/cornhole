@@ -1,5 +1,17 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { BagSide, CornholeGame, GameState } from './CornholeGame';
+import { useRoom } from './net/useRoom';
+import {
+  buildRoomUrl,
+  clearRoomFromUrl,
+  clearStoredRoleForRoom,
+  generateRoomCode,
+  getRoomFromUrl,
+  getStoredRoleForRoom,
+  rememberRoleForRoom,
+} from './net/roomCode';
+import { transportMode } from './net/transport';
+import type { Role } from './net/types';
 
 const initialGameState: GameState = {
   bagsRemaining: 4,
@@ -54,6 +66,22 @@ function App() {
   const [cinematicCameraEnabled, setCinematicCameraEnabled] = useState(false);
   const [hasStartedGame, setHasStartedGame] = useState(false);
   const [gameSession, setGameSession] = useState(0);
+  const [gameInstance, setGameInstance] = useState<CornholeGame | null>(null);
+
+  // Multiplayer state
+  const initialOnline = useMemo(() => {
+    const roomId = getRoomFromUrl();
+    if (!roomId) return null;
+    // A tab that previously created/joined this room remembers its role so a
+    // refresh doesn't downgrade a host into a second guest.
+    const storedRole = getStoredRoleForRoom(roomId);
+    const role: Role = storedRole ?? 'guest';
+    return { roomId, role };
+  }, []);
+  const [online, setOnline] = useState<{ roomId: string; role: Role } | null>(initialOnline);
+  const [copyFeedback, setCopyFeedback] = useState(false);
+  const localPlayerSlot: 1 | 2 = online?.role === 'guest' ? 2 : 1;
+  const netMode = transportMode();
 
   const handleStateChange = useCallback((state: GameState) => {
     setGameState(state);
@@ -71,10 +99,12 @@ function App() {
     game.setupControls(canvas);
 
     gameRef.current = game;
+    setGameInstance(game);
 
     return () => {
       game.dispose();
       gameRef.current = null;
+      setGameInstance(null);
     };
   }, [gameSession, handleStateChange, handleScoreUpdate, hasStartedGame]);
 
@@ -100,6 +130,53 @@ function App() {
     setGameSession((session) => session + 1);
     setHasStartedGame(true);
   }, []);
+
+  const handleHostOnline = useCallback(() => {
+    const roomId = generateRoomCode();
+    const url = new URL(window.location.href);
+    url.searchParams.set('room', roomId);
+    window.history.replaceState({}, '', url.toString());
+    rememberRoleForRoom(roomId, 'host');
+    setOnline({ roomId, role: 'host' });
+    handleStartGame();
+  }, [handleStartGame]);
+
+  const handleJoinOnline = useCallback(() => {
+    if (!online) return;
+    rememberRoleForRoom(online.roomId, online.role);
+    setPower(65);
+    setScoreHighlightPlayer(0);
+    previousScoresRef.current = { player1: 0, player2: 0 };
+    setGameState(initialGameState);
+    setGameSession((session) => session + 1);
+    setHasStartedGame(true);
+  }, [online]);
+
+  const handleCopyLink = useCallback(async () => {
+    if (!online) return;
+    const url = buildRoomUrl(online.roomId);
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopyFeedback(true);
+      window.setTimeout(() => setCopyFeedback(false), 1500);
+    } catch {
+      window.prompt('Copy this link to share:', url);
+    }
+  }, [online]);
+
+  const handleLeaveOnline = useCallback(() => {
+    if (online) clearStoredRoleForRoom(online.roomId);
+    clearRoomFromUrl();
+    setOnline(null);
+    setHasStartedGame(false);
+  }, [online]);
+
+  const room = useRoom({
+    roomId: online?.roomId ?? '',
+    role: online?.role ?? 'host',
+    localPlayerSlot,
+    game: online && hasStartedGame ? gameInstance : null,
+  });
 
   useEffect(() => {
     const previousScores = previousScoresRef.current;
@@ -203,17 +280,161 @@ function App() {
           <div className="w-full max-w-xl rounded-[32px] border border-white/10 bg-black/60 px-10 py-12 text-center shadow-[0_30px_80px_rgba(0,0,0,0.55)] backdrop-blur-md">
             <div className="mb-3 text-sm font-bold uppercase tracking-[0.35em] text-white/45">Cornhole</div>
             <h1 className="mb-4 text-5xl font-black text-white">Backyard Showdown</h1>
-            <p className="mx-auto mb-8 max-w-md text-sm text-gray-300">
-              Sink bags, land on the board, and race to 21. Use the arrow keys to move, hold C to inspect the hole, pull to throw, and press F to flip the bag side.
+            {online ? (
+              <>
+                <p className="mx-auto mb-2 max-w-md text-sm text-gray-300">
+                  {online.role === 'host' ? 'Rejoining your hosted room ' : "You've been invited to room "}
+                  <span className="font-mono font-bold text-white">{online.roomId}</span>.
+                </p>
+                <p className="mx-auto mb-8 max-w-md text-xs text-gray-400">
+                  {online.role === 'host'
+                    ? 'Reconnecting as Player 1 (Red). Match state resets on host rejoin.'
+                    : "You'll play as Player 2 (Blue). Host controls when the match starts."}
+                </p>
+                <div className="flex items-center justify-center gap-3">
+                  <button
+                    type="button"
+                    onClick={handleJoinOnline}
+                    className="inline-flex items-center justify-center rounded-full bg-blue-500 px-8 py-3 text-sm font-black uppercase tracking-[0.2em] text-white shadow-[0_15px_35px_rgba(59,130,246,0.45)] transition-transform duration-200 hover:scale-105 hover:bg-blue-400"
+                  >
+                    {online.role === 'host' ? 'Rejoin match' : 'Join match'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleLeaveOnline}
+                    className="inline-flex items-center justify-center rounded-full border border-white/20 px-6 py-3 text-xs font-bold uppercase tracking-[0.2em] text-white/70 hover:bg-white/10"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="mx-auto mb-8 max-w-md text-sm text-gray-300">
+                  Sink bags, land on the board, and race to 21. Use the arrow keys to move, hold C to inspect the hole, pull to throw, and press F to flip the bag side.
+                </p>
+                <div className="flex flex-col items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={handleStartGame}
+                    className="inline-flex items-center justify-center rounded-full bg-blue-500 px-8 py-3 text-sm font-black uppercase tracking-[0.2em] text-white shadow-[0_15px_35px_rgba(59,130,246,0.45)] transition-transform duration-200 hover:scale-105 hover:bg-blue-400"
+                  >
+                    Play local (2 players)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleHostOnline}
+                    className="inline-flex items-center justify-center rounded-full border border-white/25 bg-white/5 px-6 py-2.5 text-xs font-bold uppercase tracking-[0.2em] text-white/85 hover:bg-white/15"
+                  >
+                    Play online — host a room
+                  </button>
+                  {netMode === 'broadcast' && (
+                    <div className="mt-1 text-[10px] uppercase tracking-[0.22em] text-amber-300/70">
+                      No Supabase configured — only same-browser tabs can connect
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {online && room.rejected && (
+        <div className="absolute inset-0 z-[60] flex items-center justify-center bg-black/80 px-6 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-red-500/40 bg-black/80 px-8 py-10 text-center shadow-[0_20px_60px_rgba(239,68,68,0.25)]">
+            <div className="mb-2 text-xs font-bold uppercase tracking-[0.35em] text-red-300/80">Room full</div>
+            <h2 className="mb-3 text-2xl font-black text-white">This match is already underway.</h2>
+            <p className="mx-auto mb-6 max-w-xs text-sm text-gray-300">
+              Room <span className="font-mono font-bold text-white">{online.roomId}</span> already has two players connected. Ask the host for a new invite link.
             </p>
             <button
               type="button"
-              onClick={handleStartGame}
-              className="inline-flex items-center justify-center rounded-full bg-blue-500 px-8 py-3 text-sm font-black uppercase tracking-[0.2em] text-white shadow-[0_15px_35px_rgba(59,130,246,0.45)] transition-transform duration-200 hover:scale-105 hover:bg-blue-400"
+              onClick={handleLeaveOnline}
+              className="inline-flex items-center justify-center rounded-full bg-white/10 px-6 py-2.5 text-xs font-bold uppercase tracking-[0.2em] text-white hover:bg-white/20"
             >
-              Play
+              Leave
             </button>
           </div>
+        </div>
+      )}
+
+      {online && hasStartedGame && !room.rejected && (
+        <div className="pointer-events-auto absolute right-4 top-1/2 z-30 w-[280px] -translate-y-1/2 rounded-xl border border-white/15 bg-black/75 px-4 py-3 text-xs backdrop-blur-sm">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="font-bold uppercase tracking-[0.2em] text-white/70">
+              {online.role === 'host' ? 'Hosting' : 'Joined'} · {online.roomId}
+            </span>
+            <span
+              className={`rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider ${
+                room.peerConnected
+                  ? 'bg-emerald-500/25 text-emerald-300 shadow-[0_0_10px_rgba(16,185,129,0.35)]'
+                  : room.status === 'connected'
+                    ? 'bg-amber-500/20 text-amber-300'
+                    : 'bg-red-500/20 text-red-300'
+              }`}
+            >
+              {room.peerConnected
+                ? 'Both connected'
+                : room.status === 'connected'
+                  ? 'Waiting for opponent...'
+                  : room.status}
+            </span>
+          </div>
+          <div className="mb-2 flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1.5">
+            <span
+              className={`inline-block h-2 w-2 rounded-full ${
+                room.status === 'connected' ? 'bg-emerald-400 shadow-[0_0_6px_rgba(74,222,128,0.9)]' : 'bg-gray-500'
+              }`}
+            />
+            <span className="text-[11px] font-semibold text-white/85">
+              {online.role === 'host' ? 'You (Player 1, Red)' : 'You (Player 2, Blue)'}
+            </span>
+          </div>
+          <div className="mb-2 flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-2.5 py-1.5">
+            <span
+              className={`inline-block h-2 w-2 rounded-full ${
+                room.peerConnected ? 'bg-emerald-400 shadow-[0_0_6px_rgba(74,222,128,0.9)]' : 'bg-gray-500 animate-pulse'
+              }`}
+            />
+            <span className="text-[11px] font-semibold text-white/85">
+              {online.role === 'host' ? 'Opponent (Player 2, Blue)' : 'Host (Player 1, Red)'}
+            </span>
+            {!room.peerConnected && (
+              <span className="ml-auto text-[10px] uppercase tracking-wider text-amber-300/80">Not joined</span>
+            )}
+          </div>
+          <div className="mt-1 text-[11px] text-gray-400">
+            {gameState.currentPlayer === localPlayerSlot ? 'Your turn' : 'Waiting on opponent'}
+          </div>
+          {online.role === 'host' && (
+            <div className="mt-3 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleCopyLink}
+                className="flex-1 rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-[11px] font-bold uppercase tracking-[0.14em] text-white/80 hover:bg-white/15"
+              >
+                {copyFeedback ? 'Copied!' : 'Copy invite link'}
+              </button>
+              <button
+                type="button"
+                onClick={handleLeaveOnline}
+                className="rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-[11px] font-bold uppercase tracking-[0.14em] text-white/60 hover:bg-red-500/25 hover:text-red-200"
+                title="Leave match"
+              >
+                Leave
+              </button>
+            </div>
+          )}
+          {online.role === 'guest' && (
+            <button
+              type="button"
+              onClick={handleLeaveOnline}
+              className="mt-2 w-full rounded-md border border-white/15 bg-white/5 px-3 py-1.5 text-[11px] font-bold uppercase tracking-[0.14em] text-white/60 hover:bg-red-500/25 hover:text-red-200"
+            >
+              Leave match
+            </button>
+          )}
         </div>
       )}
 
@@ -255,10 +476,10 @@ function App() {
             top: `calc(${speedBubble.top} - 18px)`,
           }}
         >
-          <div className="min-w-[150px] rounded-2xl border border-white/15 bg-black/78 px-4 py-3 shadow-[0_16px_35px_rgba(0,0,0,0.45)] backdrop-blur-sm">
+          <div className="min-w-[175px] rounded-2xl border border-white/15 bg-black/78 px-4 py-3 shadow-[0_16px_35px_rgba(0,0,0,0.45)] backdrop-blur-sm">
             <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-[0.28em] text-white/55">
               <span className="flex-1 text-center">Trajectory</span>
-              <span className="tabular-nums text-white/70">&nbsp;{Math.round(gameState.throwDistanceFeet)}ft</span>
+              <span className="tabular-nums text-white/70">&nbsp;{Math.min(Math.round((gameState.throwDistanceFeet / 30) * 100), 500)}%</span>
             </div>
             <div className="mt-2 h-2.5 overflow-hidden rounded-full bg-white/12">
               <div
@@ -384,7 +605,7 @@ function App() {
         <div className="pointer-events-none absolute bottom-24 left-1/2 z-20 -translate-x-1/2">
           <div className="rounded-full border border-white/20 bg-black/70 px-6 py-2 backdrop-blur-sm">
             <span className="text-sm font-medium text-white/80">
-              Left/right arrows move. Hold C to inspect the hole. F flips the bag. T changes throw style. Pull for distance, release to lock speed
+              ←/→ to move. Hold C to inspect the hole. Click and drag back for power, release to lock angle
             </span>
           </div>
         </div>

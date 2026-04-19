@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.103.3",
     "@types/three": "^0.183.1",
     "cannon-es": "^0.20.0",
     "clsx": "2.1.1",
