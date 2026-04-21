@@ -67,6 +67,9 @@ function App() {
   const [hasStartedGame, setHasStartedGame] = useState(false);
   const [gameSession, setGameSession] = useState(0);
   const [gameInstance, setGameInstance] = useState<CornholeGame | null>(null);
+  const [matchResult, setMatchResult] = useState<
+    { player1Score: number; player2Score: number; winner: 1 | 2 } | null
+  >(null);
 
   // Multiplayer state
   const initialOnline = useMemo(() => {
@@ -113,14 +116,33 @@ function App() {
   }, [cinematicCameraEnabled]);
 
   useEffect(() => {
-    if (!gameState.gameOver) return;
+    if (!gameState.gameOver) {
+      // A fresh game started (either locally or a rematch snapshot arrived).
+      // Clear any lingering rematch modal.
+      if (matchResult !== null && hasStartedGame) setMatchResult(null);
+      return;
+    }
+
+    // Capture final scores the instant the match ends so the rematch modal
+    // doesn't flicker when the game's own resetBags() runs a couple seconds later.
+    const winner: 1 | 2 = gameState.player1Score >= gameState.player2Score ? 1 : 2;
+    setMatchResult({
+      player1Score: gameState.player1Score,
+      player2Score: gameState.player2Score,
+      winner,
+    });
+
+    if (online) {
+      // Stay connected — the rematch modal lives on top of the running game.
+      return;
+    }
 
     setHasStartedGame(false);
     setPower(65);
     setScoreHighlightPlayer(0);
     previousScoresRef.current = { player1: 0, player2: 0 };
     setGameState(initialGameState);
-  }, [gameState.gameOver]);
+  }, [gameState.gameOver, gameState.player1Score, gameState.player2Score, online, hasStartedGame, matchResult]);
 
   const handleStartGame = useCallback(() => {
     setPower(65);
@@ -169,7 +191,17 @@ function App() {
     clearRoomFromUrl();
     setOnline(null);
     setHasStartedGame(false);
+    setMatchResult(null);
   }, [online]);
+
+  const handleRematch = useCallback(() => {
+    if (!gameInstance) return;
+    setPower(65);
+    setScoreHighlightPlayer(0);
+    previousScoresRef.current = { player1: 0, player2: 0 };
+    setMatchResult(null);
+    gameInstance.restartMatch();
+  }, [gameInstance]);
 
   const room = useRoom({
     roomId: online?.roomId ?? '',
@@ -215,6 +247,9 @@ function App() {
         top: `${gameState.dragStartY * 100}%`,
       }
     : null;
+  // In multiplayer, the opponent's drag UI (pull-back line + trajectory bubble)
+  // is private to whoever is throwing — don't leak their aim to the other side.
+  const hideOpponentAim = online !== null && gameState.currentPlayer !== localPlayerSlot;
 
   const visualTurnPlayer = gameState.isThrowing && gameState.throwingPlayer !== null
     ? gameState.throwingPlayer
@@ -255,7 +290,9 @@ function App() {
     : gameState.isThrowing
       ? 'Bag in flight...'
       : gameState.isAiming
-        ? (gameState.isDragging ? gameState.message : `${currentPlayerLabel}'s turn`)
+        ? (gameState.isDragging
+            ? (hideOpponentAim ? `${currentPlayerLabel} is throwing...` : gameState.message)
+            : `${currentPlayerLabel}'s turn`)
         : gameState.message;
   const player1CardClass = scoreHighlightPlayer === 1
     ? 'border-yellow-300 bg-red-950/75 shadow-[0_0_24px_rgba(250,204,21,0.55),0_0_50px_rgba(239,68,68,0.28)] scale-110'
@@ -268,12 +305,30 @@ function App() {
       ? 'border-blue-500 bg-blue-950/60 shadow-[0_0_20px_rgba(59,130,246,0.4),0_0_40px_rgba(59,130,246,0.15)] scale-105'
       : 'border-gray-700 bg-black/60 opacity-70';
 
+  const myTurnInOnline =
+    online !== null &&
+    hasStartedGame &&
+    !room.rejected &&
+    gameState.currentPlayer === localPlayerSlot &&
+    !gameState.gameOver;
+  const turnFrameColor = localPlayerSlot === 1 ? 'rgba(239,68,68,0.55)' : 'rgba(59,130,246,0.55)';
+  const turnFrameGlow = localPlayerSlot === 1 ? 'rgba(239,68,68,0.18)' : 'rgba(59,130,246,0.18)';
+
   return (
     <div className="relative h-screen w-full overflow-hidden bg-black select-none">
       <canvas
         ref={canvasRef}
         className={`absolute inset-0 h-full w-full ${hasStartedGame ? 'cursor-crosshair' : 'pointer-events-none opacity-30 blur-[1px]'}`}
       />
+
+      {myTurnInOnline && (
+        <div
+          className="pointer-events-none absolute inset-0 z-[45] transition-opacity duration-300"
+          style={{
+            boxShadow: `inset 0 0 0 3px ${turnFrameColor}, inset 0 0 60px ${turnFrameGlow}`,
+          }}
+        />
+      )}
 
       {!hasStartedGame && (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-[radial-gradient(circle_at_top,_rgba(37,99,235,0.18),_transparent_38%),linear-gradient(180deg,_rgba(0,0,0,0.72),_rgba(0,0,0,0.9))] px-6">
@@ -355,6 +410,53 @@ function App() {
             >
               Leave
             </button>
+          </div>
+        </div>
+      )}
+
+      {online && matchResult && !room.rejected && (
+        <div className="absolute inset-0 z-[55] flex items-center justify-center bg-black/80 px-6 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-white/15 bg-black/85 px-8 py-10 text-center shadow-[0_20px_60px_rgba(0,0,0,0.5)]">
+            <div className="mb-3 text-xs font-bold uppercase tracking-[0.35em] text-white/50">Match over</div>
+            <h2
+              className={`mb-6 text-3xl font-black ${
+                matchResult.winner === 1 ? 'text-red-300' : 'text-blue-300'
+              }`}
+            >
+              {matchResult.winner === localPlayerSlot ? 'You win!' : `Player ${matchResult.winner} wins!`}
+            </h2>
+            <div className="mb-8 grid grid-cols-2 gap-3">
+              <div className={`rounded-xl border px-4 py-3 ${matchResult.winner === 1 ? 'border-red-400 bg-red-950/60' : 'border-white/10 bg-white/5'}`}>
+                <div className="text-[11px] font-bold uppercase tracking-[0.2em] text-red-300/80">Player 1</div>
+                <div className="text-4xl font-black text-white">{matchResult.player1Score}</div>
+              </div>
+              <div className={`rounded-xl border px-4 py-3 ${matchResult.winner === 2 ? 'border-blue-400 bg-blue-950/60' : 'border-white/10 bg-white/5'}`}>
+                <div className="text-[11px] font-bold uppercase tracking-[0.2em] text-blue-300/80">Player 2</div>
+                <div className="text-4xl font-black text-white">{matchResult.player2Score}</div>
+              </div>
+            </div>
+            <div className="flex items-center justify-center gap-3">
+              {online.role === 'host' ? (
+                <button
+                  type="button"
+                  onClick={handleRematch}
+                  className="inline-flex items-center justify-center rounded-full bg-blue-500 px-8 py-3 text-sm font-black uppercase tracking-[0.2em] text-white shadow-[0_15px_35px_rgba(59,130,246,0.45)] transition-transform duration-200 hover:scale-105 hover:bg-blue-400"
+                >
+                  Rematch
+                </button>
+              ) : (
+                <div className="rounded-full border border-white/20 px-6 py-3 text-xs font-bold uppercase tracking-[0.2em] text-white/60">
+                  Waiting for host to start a rematch...
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={handleLeaveOnline}
+                className="inline-flex items-center justify-center rounded-full border border-white/20 px-6 py-3 text-xs font-bold uppercase tracking-[0.2em] text-white/70 hover:bg-white/10"
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -444,7 +546,7 @@ function App() {
         </div>
       </div>
 
-      {dragLine && (
+      {dragLine && !hideOpponentAim && (
         <svg className="pointer-events-none absolute inset-0 z-20 h-full w-full">
           <defs>
             <linearGradient id="pullback-line" x1="0%" y1="0%" x2="100%" y2="0%">
@@ -468,7 +570,7 @@ function App() {
         </svg>
       )}
 
-      {speedBubble && (
+      {speedBubble && !hideOpponentAim && (
         <div
           className="pointer-events-none absolute z-30 -translate-x-full -translate-y-full"
           style={{

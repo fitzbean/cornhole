@@ -37,6 +37,9 @@ export interface Snapshot {
   cameraLook: [number, number, number];
   timeOfDay: number;
   seq: number;
+  // When true, `bags` only contains the in-flight bag; guest must merge with
+  // its existing settled bags instead of replacing the full set.
+  flightOnly: boolean;
 }
 
 export type Envelope =

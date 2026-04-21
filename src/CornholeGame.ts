@@ -24,6 +24,11 @@ const DAWN_TIME = 6;
 const DUSK_TIME = 19;
 const INSPECT_CAMERA_MIN_DISTANCE = 2.2;
 const INSPECT_CAMERA_MAX_DISTANCE = 7.5;
+// Guest renders `now - GUEST_RENDER_DELAY` so there's almost always a future
+// snapshot to interpolate toward. Adds a small perceived latency but removes
+// the arrive-and-wait stepping that straight-to-latest lerping produces.
+const GUEST_RENDER_DELAY = 0.08;
+const BROADCAST_INTERVAL = 0.025; // 20Hz cap
 const PLAYER_DEFAULT_X: Record<1 | 2, number> = {
   1: -1.15,
   2: 1.15,
@@ -268,6 +273,26 @@ export class CornholeGame {
   snapshotSeq = 0;
   onSnapshot: ((snapshot: import('./net/types').Snapshot) => void) | null = null;
   onLocalIntent: ((intent: import('./net/types').Intent) => void) | null = null;
+  // Unified broadcast throttle: at most one snapshot send per 50ms, no matter
+  // which code path asks. Multiple requests within a window collapse into a
+  // single trailing send where a queued FULL request wins over FLIGHT (we'd
+  // rather lose motion-smoothing samples than a real state transition).
+  private lastBroadcastAt = 0;
+  private queuedBroadcast: 'full' | 'flight' | null = null;
+  private queuedBroadcastTimer: number | null = null;
+  // Guest-only interpolation state. Each bag keeps a short buffer of recent
+  // snapshots (sample time + pose). Each render frame we render at
+  // `now - GUEST_RENDER_DELAY`, picking the two samples that bracket that time
+  // and interpolating between them. This is "render-delayed interpolation" —
+  // by rendering in the past by a fixed amount we always have a future sample
+  // to head toward, eliminating the arrive-and-wait stepping you get when
+  // lerping to the newest sample directly.
+  private guestBagSamples: {
+    t: number;
+    pos: THREE.Vector3;
+    quat: THREE.Quaternion;
+  }[][] = [];
+  private guestFirstSnapshotAt = 0;
 
   // Callbacks
   onStateChange: (state: GameState) => void;
@@ -2736,6 +2761,12 @@ export class CornholeGame {
       if (!this.isDragging) return;
       const ndc = this.getPointerNdc(event);
       this.dragCurrent.copy(ndc);
+      // Client-side prediction: update aim + UI locally so the guest's own
+      // drag visuals (power bar, pull line) respond at 60fps without waiting
+      // for the host→guest snapshot round-trip. The host will still receive
+      // the intent and drive the authoritative throw on release.
+      this.updateAimFromDrag();
+      this.emitState();
       this.onLocalIntent?.({ type: 'dragMove', ndcX: ndc.x, ndcY: ndc.y });
       return;
     }
@@ -2760,8 +2791,12 @@ export class CornholeGame {
       if (!this.state.isAiming || this.state.isThrowing || this.state.gameOver) return;
       const ndc = this.getPointerNdc(event);
       this.isDragging = true;
+      this.state.isDragging = true;
       this.dragStart.copy(ndc);
       this.dragCurrent.copy(ndc);
+      this.aimX = 0;
+      this.pullDistance = 0.18;
+      this.emitState();
       this.onLocalIntent?.({ type: 'dragStart', ndcX: ndc.x, ndcY: ndc.y });
       return;
     }
@@ -3023,8 +3058,56 @@ export class CornholeGame {
     this.state.dragCurrentY = (1 - this.dragCurrent.y) * 0.5;
     this.onStateChange({ ...this.state });
     if (!this.guestMode && this.onSnapshot) {
-      this.onSnapshot(this.serializeSnapshot());
+      // Skip broadcasting drag-in-progress state. The guest UI hides the
+      // opponent's aim anyway, so every mousemove-driven emitState during a
+      // pull-back would just fill the 20Hz broadcast budget with invisible
+      // updates, starving real transitions. The throw release still flips
+      // isThrowing and clears isDragging, which broadcasts normally.
+      if (!this.state.isDragging) {
+        this.requestBroadcast('full');
+      }
     }
+  }
+
+  // Single choke point for every network send. Any code path that wants to
+  // push state to the guest queues a request here; the queue runs at most
+  // once per BROADCAST_INTERVAL (50ms = 20Hz). If multiple requests land in
+  // the same window they collapse: a full-state request wins over a
+  // flight-only request (we'd rather drop a smoothing sample than a real
+  // transition like bag-settled / round-over).
+  private requestBroadcast(kind: 'full' | 'flight') {
+    if (!this.onSnapshot) return;
+    if (!this.onlineHostMode) {
+      // Hot-seat has no network peer, so cost is zero and we can send every
+      // request directly. (In practice onSnapshot is null in hot-seat anyway.)
+      this.onSnapshot(kind === 'flight' ? this.serializeFlightSnapshot() : this.serializeSnapshot());
+      return;
+    }
+    // Promote flight→full if a full is already waiting.
+    if (this.queuedBroadcast === 'full' || kind === 'full') this.queuedBroadcast = 'full';
+    else this.queuedBroadcast = 'flight';
+
+    const sinceLast = this.totalTime - this.lastBroadcastAt;
+
+    if (sinceLast >= BROADCAST_INTERVAL && this.queuedBroadcastTimer === null) {
+      // Leading edge: no recent send and nothing pending — fire now.
+      this.flushQueuedBroadcast();
+      return;
+    }
+    if (this.queuedBroadcastTimer !== null) return;
+    const waitMs = Math.max(0, (BROADCAST_INTERVAL - sinceLast) * 1000);
+    this.queuedBroadcastTimer = window.setTimeout(() => {
+      this.queuedBroadcastTimer = null;
+      this.flushQueuedBroadcast();
+    }, waitMs);
+  }
+
+  private flushQueuedBroadcast() {
+    if (this.isDisposed || !this.onSnapshot || this.queuedBroadcast === null) return;
+    const kind = this.queuedBroadcast;
+    this.queuedBroadcast = null;
+    this.lastBroadcastAt = this.totalTime;
+    this.onSnapshot(kind === 'flight' ? this.serializeFlightSnapshot() : this.serializeSnapshot());
   }
 
   renderGameToText = () => JSON.stringify({
@@ -3175,10 +3258,18 @@ export class CornholeGame {
 
       // Broadcast snapshots during flight/settling so the guest can see the bag move.
       // emitState only fires on state transitions — physics updates bodies every frame
-      // without touching state, so we emit a dedicated broadcast per-tick here.
+      // without touching state. requestBroadcast collapses with any concurrent
+      // emitState calls, giving a single unified 20Hz send rate to the guest.
       if (this.onSnapshot && (this.state.isThrowing || this.state.isSettling)) {
-        this.onSnapshot(this.serializeSnapshot());
+        this.requestBroadcast('flight');
       }
+    }
+
+    // On the guest, blend bag meshes from the last snapshot toward the newest
+    // before softness code reads them, so soft-body deformation tracks the
+    // smoothed visual rather than jumping between 20Hz snapshot positions.
+    if (this.guestMode) {
+      this.stepGuestInterpolation(dt);
     }
 
     // Sync bag visuals
@@ -3301,6 +3392,10 @@ export class CornholeGame {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = null;
     }
+    if (this.queuedBroadcastTimer !== null) {
+      window.clearTimeout(this.queuedBroadcastTimer);
+      this.queuedBroadcastTimer = null;
+    }
     window.removeEventListener('resize', this.handleResize);
     window.removeEventListener('keydown', this.handleKeyDown);
     window.removeEventListener('keyup', this.handleKeyUp);
@@ -3338,6 +3433,57 @@ export class CornholeGame {
     this.guestMode = enabled;
     this.onlineHostMode = false;
     this.localPlayerSlot = localPlayerSlot;
+  }
+
+  // Fully reset the match in place without disposing the game instance. Used
+  // for the online rematch flow where disposing would drop the transport
+  // subscription and force the guest to reconnect.
+  restartMatch() {
+    this.state.player1Score = 0;
+    this.state.player2Score = 0;
+    this.state.player1RoundScore = 0;
+    this.state.player2RoundScore = 0;
+    this.state.player1Ppr = 0;
+    this.state.player2Ppr = 0;
+    this.state.inning = 1;
+    this.state.bagsThisInning = 0;
+    this.state.gameOver = false;
+    this.state.showResult = false;
+    this.state.resultMessage = '';
+    this.state.lastPoints = 0;
+    this.state.lastResult = '';
+    this.state.throwingPlayer = null;
+    this.state.isThrowing = false;
+    this.state.isSettling = false;
+    this.inningBaseScores[1] = 0;
+    this.inningBaseScores[2] = 0;
+    this.cumulativeRoundPoints[1] = 0;
+    this.cumulativeRoundPoints[2] = 0;
+    this.playerBagsThrown[1] = 0;
+    this.playerBagsThrown[2] = 0;
+    this.nextInningStarter = 1;
+    this.activeThrownBagIndex = null;
+    this.settlingTimer = 0;
+    this.bagSettled = false;
+    this.aimX = 0;
+    this.pullDistance = 0.3;
+    this.aimPower = 0.65;
+    for (let i = 0; i < 8; i++) {
+      if (this.bags[i]) this.bags[i].visible = false;
+      if (this.bagBodies[i]) {
+        this.bagBodies[i].position.set(0, -20, 0);
+        this.bagBodies[i].velocity.set(0, 0, 0);
+        this.bagBodies[i].angularVelocity.set(0, 0, 0);
+      }
+      this.resetBagVisualState(i);
+    }
+    this.bagThrowStyles.fill('slide');
+    this.bagInHole.fill(false);
+    this.bagInHoleDetectedAt.fill(0);
+    this.bagPendingHoleCleanup.fill(false);
+    this.bagHoleCleanupReadyAt.fill(0);
+    this.startTurn(1);
+    this.emitState();
   }
 
   setHostMode(localPlayerSlot: 1 | 2, online = false) {
@@ -3466,7 +3612,19 @@ export class CornholeGame {
     }
   }
 
+  // Full snapshot — used on state transitions (throw start, evaluate, inning end).
+  // Includes every visible bag so the guest can resync fully.
   serializeSnapshot(): import('./net/types').Snapshot {
+    return this.serializeSnapshotInternal(false);
+  }
+
+  // Flight-only snapshot — includes only the in-flight bag. Settled bags haven't
+  // moved so re-sending them every 50ms wastes bandwidth.
+  serializeFlightSnapshot(): import('./net/types').Snapshot {
+    return this.serializeSnapshotInternal(true);
+  }
+
+  private serializeSnapshotInternal(flightOnly: boolean): import('./net/types').Snapshot {
     this.snapshotSeq++;
     const bags: import('./net/types').BagSnapshot[] = [];
     for (let i = 0; i < this.bags.length; i++) {
@@ -3474,6 +3632,7 @@ export class CornholeGame {
       const body = this.bagBodies[i];
       if (!mesh || !body) continue;
       if (!mesh.visible) continue;
+      if (flightOnly && i !== this.activeThrownBagIndex) continue;
       bags.push({
         index: i,
         visible: true,
@@ -3495,6 +3654,7 @@ export class CornholeGame {
       cameraLook: [this.cameraLookTarget.x, this.cameraLookTarget.y, this.cameraLookTarget.z],
       timeOfDay: this.timeOfDay,
       seq: this.snapshotSeq,
+      flightOnly,
     };
   }
 
@@ -3524,27 +3684,161 @@ export class CornholeGame {
     this.dragCurrent.set(snapshot.state.dragCurrentX * 2 - 1, 1 - snapshot.state.dragCurrentY * 2);
     this.isDragging = snapshot.state.isDragging;
 
-    // Hide all bags, then show/position only the ones in the snapshot.
-    for (let i = 0; i < this.bags.length; i++) {
-      if (this.bags[i]) this.bags[i].visible = false;
-      this.bagInHole[i] = false;
+    // Full snapshots replace the whole bag set (hide all, re-apply what's in
+    // the snapshot). Flight snapshots only update the one bag in motion, so
+    // settled bags stay where the last full snapshot placed them.
+    if (!snapshot.flightOnly) {
+      for (let i = 0; i < this.bags.length; i++) {
+        if (this.bags[i]) this.bags[i].visible = false;
+        this.bagInHole[i] = false;
+      }
     }
+
+    // Keep activeThrownBagIndex in sync so guest-side features that follow the
+    // in-flight bag (e.g. cinematic camera) work. Flight-only snapshots only
+    // carry the moving bag so it's always bags[0]; full snapshots while a
+    // throw is in progress also include it, so pick the same bag out.
+    if (snapshot.state.isThrowing || snapshot.state.isSettling) {
+      if (snapshot.flightOnly && snapshot.bags.length > 0) {
+        this.activeThrownBagIndex = snapshot.bags[0].index;
+      } else if (!snapshot.flightOnly && snapshot.bags.length > 0) {
+        // The most recently thrown bag is the highest-index bag for the
+        // throwing player's range (0–3 for P1, 4–7 for P2).
+        const throwing = snapshot.state.throwingPlayer;
+        const range = throwing === 1 ? [0, 3] : throwing === 2 ? [4, 7] : null;
+        if (range) {
+          let latest = -1;
+          for (const bag of snapshot.bags) {
+            if (bag.index >= range[0] && bag.index <= range[1] && bag.index > latest) {
+              latest = bag.index;
+            }
+          }
+          if (latest >= 0) this.activeThrownBagIndex = latest;
+        }
+      }
+    } else {
+      this.activeThrownBagIndex = null;
+    }
+
+    this.ensureGuestBagSamples();
+
+    const now = performance.now() / 1000;
+    if (this.guestFirstSnapshotAt === 0) this.guestFirstSnapshotAt = now;
+
+    // A bag index is "new" (just thrown, or just re-appeared after a reset)
+    // when its sample buffer is empty. The full-snapshot branch above hides
+    // every bag each frame, but we don't want that to force a sample reset —
+    // only an actual "never seen before / freshly thrown" transition should.
+    // So we detect freshness from an empty buffer instead of mesh.visible.
     for (const bag of snapshot.bags) {
       const mesh = this.bags[bag.index];
       const body = this.bagBodies[bag.index];
       if (!mesh || !body) continue;
+
+      const samples = this.guestBagSamples[bag.index];
+      // A genuinely new bag is one whose last sample was long enough ago that
+      // we can treat it as a fresh throw (or one with no samples at all).
+      // During an active throw, snapshots arrive every ~50–100ms, so any gap
+      // >500ms means this bag was off-screen and is now reappearing.
+      const lastSampleAge = samples.length > 0 ? now - samples[samples.length - 1].t : Infinity;
+      const isFreshThrow = samples.length === 0 || lastSampleAge > 0.5;
+
       mesh.visible = bag.visible;
       this.bagInHole[bag.index] = bag.inHole;
       this.bagSides[bag.index] = bag.side;
       this.bagThrowStyles[bag.index] = bag.throwStyle;
+
+      if (isFreshThrow) {
+        // Brand new throw — plant mesh at launch position, clear any stale samples.
+        samples.length = 0;
+        mesh.position.set(bag.x, bag.y, bag.z);
+        mesh.quaternion.set(bag.qx, bag.qy, bag.qz, bag.qw);
+      }
+      samples.push({
+        t: now,
+        pos: new THREE.Vector3(bag.x, bag.y, bag.z),
+        quat: new THREE.Quaternion(bag.qx, bag.qy, bag.qz, bag.qw),
+      });
+      // Drop samples older than the render delay + a margin so we always keep
+      // at least the two bracketing samples.
+      const keepAfter = now - GUEST_RENDER_DELAY - 0.25;
+      while (samples.length > 2 && samples[0].t < keepAfter) samples.shift();
+
+      // Keep the body on the *newest* target so non-positional code (e.g.
+      // capturing settled state for future snapshots) has a sane reference.
       body.position.set(bag.x, bag.y, bag.z);
       body.quaternion.set(bag.qx, bag.qy, bag.qz, bag.qw);
-      mesh.position.copy(body.position as unknown as THREE.Vector3);
-      mesh.quaternion.copy(body.quaternion as unknown as THREE.Quaternion);
       body.velocity.setZero();
       body.angularVelocity.setZero();
       body.sleep();
     }
     this.emitState();
+  }
+
+  private ensureGuestBagSamples() {
+    if (this.guestBagSamples.length === this.bags.length) return;
+    this.guestBagSamples = this.bags.map(() => []);
+  }
+
+  // Called each render frame on the guest. For each visible bag, picks the
+  // two samples that bracket renderTime = now - GUEST_RENDER_DELAY and
+  // interpolates between them. Because we render "in the past" by a fixed
+  // amount, there's almost always a future sample to head toward — so the
+  // bag never arrives-and-waits the way straight-to-latest lerping does.
+  private stepGuestInterpolation(_dt: number) {
+    if (!this.guestMode || this.guestBagSamples.length === 0) return;
+    const now = performance.now() / 1000;
+    // Ramp up render delay gradually on the first snapshot so we don't
+    // visually freeze for 80ms waiting for the buffer to fill.
+    const sinceFirst = now - this.guestFirstSnapshotAt;
+    const delay = Math.min(GUEST_RENDER_DELAY, sinceFirst);
+    const renderT = now - delay;
+    for (let i = 0; i < this.bags.length; i++) {
+      const mesh = this.bags[i];
+      const body = this.bagBodies[i];
+      const samples = this.guestBagSamples[i];
+      if (!mesh || !body || !mesh.visible || !samples || samples.length === 0) continue;
+
+      // Find the two samples that bracket renderT. If renderT is before all
+      // samples, clamp to the oldest; if after all, extrapolate slightly from
+      // the last two so motion continues instead of freezing.
+      let a = samples[0];
+      let b = samples[0];
+      let bracketed = false;
+      for (let j = 0; j < samples.length - 1; j++) {
+        if (samples[j].t <= renderT && samples[j + 1].t >= renderT) {
+          a = samples[j];
+          b = samples[j + 1];
+          bracketed = true;
+          break;
+        }
+      }
+      if (!bracketed) {
+        if (renderT < samples[0].t) {
+          // Haven't reached oldest sample yet — just hold at it.
+          a = samples[0];
+          b = samples[0];
+        } else {
+          // renderT is ahead of newest — extrapolate from last two so the bag
+          // doesn't freeze if the next snapshot is a little late.
+          a = samples.length >= 2 ? samples[samples.length - 2] : samples[samples.length - 1];
+          b = samples[samples.length - 1];
+        }
+      }
+
+      let progress: number;
+      if (b.t === a.t) {
+        progress = 0;
+      } else {
+        progress = (renderT - a.t) / (b.t - a.t);
+        // Cap extrapolation so a long gap doesn't send the bag flying past.
+        progress = Math.max(0, Math.min(1.25, progress));
+      }
+
+      mesh.position.lerpVectors(a.pos, b.pos, progress);
+      mesh.quaternion.copy(a.quat).slerp(b.quat, Math.min(1, progress));
+      body.position.set(mesh.position.x, mesh.position.y, mesh.position.z);
+      body.quaternion.set(mesh.quaternion.x, mesh.quaternion.y, mesh.quaternion.z, mesh.quaternion.w);
+    }
   }
 }
