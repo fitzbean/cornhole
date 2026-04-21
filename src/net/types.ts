@@ -9,7 +9,7 @@ export type Intent =
   | { type: 'moveStop'; direction: 'left' | 'right' | 'up' | 'down' }
   | { type: 'dragStart'; ndcX: number; ndcY: number }
   | { type: 'dragMove'; ndcX: number; ndcY: number }
-  | { type: 'dragEnd'; ndcX: number; ndcY: number }
+  | { type: 'dragEnd'; ndcX: number; ndcY: number; aimPower: number }
   | { type: 'dragCancel' }
   | { type: 'flipBagSide' }
   | { type: 'toggleThrowStyle' }

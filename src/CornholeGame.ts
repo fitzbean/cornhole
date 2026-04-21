@@ -2829,7 +2829,12 @@ export class CornholeGame {
       const ndc = this.getPointerNdc(event);
       this.dragCurrent.copy(ndc);
       this.isDragging = false;
-      this.onLocalIntent?.({ type: 'dragEnd', ndcX: ndc.x, ndcY: ndc.y });
+      // Send the guest's locally-oscillated aimPower with the release so the
+      // host throws with the same sin value the guest actually saw when
+      // releasing — otherwise the host's own oscillator (a ~100ms-different
+      // phase) would pick a different speedT and the throw strength wouldn't
+      // match the trajectory meter the guest saw.
+      this.onLocalIntent?.({ type: 'dragEnd', ndcX: ndc.x, ndcY: ndc.y, aimPower: this.aimPower });
       return;
     }
 
@@ -3235,11 +3240,15 @@ export class CornholeGame {
         this.playerX = THREE.MathUtils.clamp(this.playerX + moveInput * dt * 2.8, minX, maxX);
         this.playerPositions[this.state.currentPlayer] = this.playerX;
       }
-      if (this.state.isAiming && !this.state.gameOver) {
-        const cycle = (Math.sin(this.totalTime * 3.8) + 1) * 0.5;
-        this.aimPower = cycle;
-        this.emitState();
-      }
+    }
+    // Aim-power oscillator is a deterministic sin(totalTime) — no authority
+    // needed — so we run it on host always, and on the guest during their own
+    // turn so their power bar animates at 60fps without relying on snapshots.
+    const canRunAimCycle = !this.guestMode || this.localPlayerSlot === this.state.currentPlayer;
+    if (canRunAimCycle && this.state.isAiming && !this.state.gameOver) {
+      const cycle = (Math.sin(this.totalTime * 3.8) + 1) * 0.5;
+      this.aimPower = cycle;
+      this.emitState();
     }
     this.updatePreviewBagMaterials();
 
@@ -3550,6 +3559,11 @@ export class CornholeGame {
         if (!this.isDragging) break;
         this.dragCurrent.set(intent.ndcX, intent.ndcY);
         this.updateAimFromDrag();
+        // Pin aimPower to the value the guest actually saw at release. Host's
+        // own oscillator runs on a different clock and would give throwBag a
+        // different speedT, making the thrown bag's speed disagree with the
+        // trajectory meter the guest was looking at when they let go.
+        this.aimPower = intent.aimPower;
         const dragDistance = this.getCurrentDragDistance();
         this.isDragging = false;
         this.state.isDragging = false;
@@ -3663,6 +3677,28 @@ export class CornholeGame {
     if (snapshot.seq <= this.snapshotSeq) return;
     this.snapshotSeq = snapshot.seq;
 
+    // Client-prediction preservation: if the guest is mid-drag on their own
+    // turn, DON'T let an incoming snapshot stomp the locally-predicted drag
+    // fields. Without this, any host broadcast that lands during the ~100ms
+    // intent-travel window overwrites dragStart / dragCurrent / aimX /
+    // pullDistance / isDragging back to host's stale values, producing visible
+    // jumps in the pull-back UI. The host becomes authoritative again the
+    // instant the guest releases (dragEnd intent flips isDragging false,
+    // throw-start snapshot arrives with real values and we accept it).
+    // While on their own turn the guest's local aim oscillator is the source
+    // of truth for aimPower; snapshots from the host carry a stale sin wave
+    // from a *different* totalTime clock, which causes visible jerks in the
+    // power bar if we let them overwrite.
+    const guestOwnsAim = !this.guestMode || this.localPlayerSlot === this.state.currentPlayer;
+    const guestIsPredicting = this.isDragging && this.localPlayerSlot === this.state.currentPlayer;
+    const preservedAimPower = this.aimPower;
+    const preservedAimX = this.aimX;
+    const preservedPullDistance = this.pullDistance;
+    const preservedDragStart = this.dragStart.clone();
+    const preservedDragCurrent = this.dragCurrent.clone();
+    const preservedThrowDistanceFeet = this.state.throwDistanceFeet;
+    const preservedMessage = this.state.message;
+
     this.state = { ...snapshot.state };
     this.playerX = snapshot.playerX;
     this.aimX = snapshot.aimX;
@@ -3683,6 +3719,31 @@ export class CornholeGame {
     this.dragStart.set(snapshot.state.dragStartX * 2 - 1, 1 - snapshot.state.dragStartY * 2);
     this.dragCurrent.set(snapshot.state.dragCurrentX * 2 - 1, 1 - snapshot.state.dragCurrentY * 2);
     this.isDragging = snapshot.state.isDragging;
+
+    if (guestOwnsAim) {
+      // Guest's local aim oscillator is authoritative for the power bar when
+      // it's their turn — host snapshots carry a stale sin value from a
+      // different clock and would cause visible jerks if we overwrote.
+      this.aimPower = preservedAimPower;
+      this.state.aimPower = preservedAimPower;
+    }
+
+    if (guestIsPredicting) {
+      // Restore locally-predicted drag state — our mousemove-driven values are
+      // fresher than whatever stale frame the host just sent us.
+      this.aimX = preservedAimX;
+      this.pullDistance = preservedPullDistance;
+      this.dragStart.copy(preservedDragStart);
+      this.dragCurrent.copy(preservedDragCurrent);
+      this.isDragging = true;
+      this.state.isDragging = true;
+      this.state.throwDistanceFeet = preservedThrowDistanceFeet;
+      this.state.message = preservedMessage;
+      this.state.dragStartX = (preservedDragStart.x + 1) * 0.5;
+      this.state.dragStartY = (1 - preservedDragStart.y) * 0.5;
+      this.state.dragCurrentX = (preservedDragCurrent.x + 1) * 0.5;
+      this.state.dragCurrentY = (1 - preservedDragCurrent.y) * 0.5;
+    }
 
     // Full snapshots replace the whole bag set (hide all, re-apply what's in
     // the snapshot). Flight snapshots only update the one bag in motion, so
