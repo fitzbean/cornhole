@@ -583,12 +583,13 @@ function App() {
               <span className="flex-1 text-center">Trajectory</span>
               <span className="tabular-nums text-white/70">&nbsp;{Math.min(Math.round((gameState.throwDistanceFeet / 30) * 100), 500)}%</span>
             </div>
-            <div className="mt-2 h-2.5 overflow-hidden rounded-full bg-white/12">
+            <div className="mt-2 h-2.5 overflow-hidden rounded-full bg-white/12 relative">
               <div
-                className="h-full rounded-full transition-none"
+                className="absolute top-0 bottom-0 w-1 rounded-full transition-none"
                 style={{
-                  width: `${power}%`,
-                  background: 'linear-gradient(90deg, #22c55e, #eab308, #ef4444)',
+                  left: `${power}%`,
+                  background: 'linear-gradient(180deg, #22c55e, #eab308, #ef4444)',
+                  transform: 'translateX(-50%)',
                 }}
               />
             </div>

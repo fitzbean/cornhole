@@ -302,6 +302,14 @@ export class CornholeGame {
   particleSystems: { points: THREE.Points; velocities: THREE.Vector3[]; life: number }[] = [];
   stickyFaceNormal = new CANNON.Vec3(0, 1, 0);
 
+  // Audio
+  audioContext: AudioContext | null = null;
+  cornholeSoundPlayed: boolean[] = Array(8).fill(false);
+  pointSoundPlayed: boolean[] = Array(8).fill(false);
+
+  // Hole detection - track previous positions for trajectory crossing
+  bagPrevPositions: THREE.Vector3[] = Array(8).fill(null).map(() => new THREE.Vector3());
+
   // Bag throw animation
   throwStartTime = 0;
   throwDuration = 0;
@@ -405,6 +413,7 @@ export class CornholeGame {
     this.createEnvironment();
     this.createPullLine();
     this.createBagPreview();
+    this.initAudio();
     this.startTurn(1);
 
     window.addEventListener('resize', this.handleResize);
@@ -811,6 +820,81 @@ export class CornholeGame {
       v.y -= vn * ny;
       v.z -= vn * nz;
     }
+  }
+
+  initAudio() {
+    try {
+      this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+    } catch (e) {
+      console.warn('Web Audio API not supported');
+    }
+  }
+
+  playCornholeSound() {
+    if (!this.audioContext) return;
+    if (this.audioContext.state === 'suspended') {
+      this.audioContext.resume();
+    }
+
+    const ctx = this.audioContext;
+    const now = ctx.currentTime;
+
+    // Create a satisfying "swish + thud" sound for cornhole
+    // Noise burst for swish
+    const noiseBuffer = ctx.createBuffer(1, ctx.sampleRate * 0.15, ctx.sampleRate);
+    const noiseData = noiseBuffer.getChannelData(0);
+    for (let i = 0; i < noiseData.length; i++) {
+      noiseData[i] = Math.random() * 2 - 1;
+    }
+    const noise = ctx.createBufferSource();
+    noise.buffer = noiseBuffer;
+    const noiseGain = ctx.createGain();
+    noiseGain.gain.setValueAtTime(0.3, now);
+    noiseGain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+    const noiseFilter = ctx.createBiquadFilter();
+    noiseFilter.type = 'bandpass';
+    noiseFilter.frequency.value = 800;
+    noise.connect(noiseFilter);
+    noiseFilter.connect(noiseGain);
+    noiseGain.connect(ctx.destination);
+    noise.start(now);
+    noise.stop(now + 0.15);
+
+    // Low thud for bag hitting bottom
+    const thudOsc = ctx.createOscillator();
+    thudOsc.type = 'sine';
+    thudOsc.frequency.setValueAtTime(150, now);
+    thudOsc.frequency.exponentialRampToValueAtTime(60, now + 0.2);
+    const thudGain = ctx.createGain();
+    thudGain.gain.setValueAtTime(0.4, now);
+    thudGain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+    thudOsc.connect(thudGain);
+    thudGain.connect(ctx.destination);
+    thudOsc.start(now);
+    thudOsc.stop(now + 0.3);
+  }
+
+  playPointSound() {
+    if (!this.audioContext) return;
+    if (this.audioContext.state === 'suspended') {
+      this.audioContext.resume();
+    }
+
+    const ctx = this.audioContext;
+    const now = ctx.currentTime;
+
+    // Create a light "tap" sound for landing on board
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(400, now);
+    osc.frequency.exponentialRampToValueAtTime(200, now + 0.1);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.2, now);
+    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.15);
   }
 
   createBags(material: CANNON.Material) {
@@ -1739,10 +1823,22 @@ export class CornholeGame {
     this.emitState();
     this.bagSides[idx] = this.selectedBagSide;
     this.bagThrowStyles[idx] = this.throwStyle;
+    this.bagInHole[idx] = false;
+    this.bagInHoleDetectedAt[idx] = 0;
+    this.bagPendingHoleCleanup[idx] = false;
+    this.bagHoleCleanupReadyAt[idx] = 0;
+    this.cornholeSoundPlayed[idx] = false;
+    this.pointSoundPlayed[idx] = false;
+    this.bagPrevPositions[idx].set(0, 0, 0);
 
     const body = this.bagBodies[idx];
     const mesh = this.bags[idx];
     this.resetBagVisualState(idx);
+
+    // Ensure body is in the physics world (it may have been removed by hole cleanup)
+    if (!this.world.bodies.includes(body)) {
+      this.world.addBody(body);
+    }
 
     const startX = this.playerX + this.aimX * 0.25;
     const startY = 1.5;
@@ -1853,6 +1949,11 @@ export class CornholeGame {
       result = '🎯 IN THE HOLE!';
     } else if (onBoardX && onBoardZ && onBoardY) {
       result = '✅ On the board!';
+      // Play point sound once when first detected on board
+      if (!this.pointSoundPlayed[bagIndex]) {
+        this.playPointSound();
+        this.pointSoundPlayed[bagIndex] = true;
+      }
     } else {
       result = '❌ Miss!';
     }
@@ -1978,6 +2079,9 @@ export class CornholeGame {
     this.bagInHoleDetectedAt.fill(0);
     this.bagPendingHoleCleanup.fill(false);
     this.bagHoleCleanupReadyAt.fill(0);
+    for (let i = 0; i < 8; i++) {
+      this.bagPrevPositions[i].set(0, 0, 0);
+    }
     this.startTurn(this.nextInningStarter);
     this.emitState();
   }
@@ -2532,44 +2636,77 @@ export class CornholeGame {
     const body = this.bagBodies[index];
     const boardWorldPos = new THREE.Vector3();
     this.boardGroup.getWorldPosition(boardWorldPos);
-    const holeWorldPos = new THREE.Vector3(
-      boardWorldPos.x,
-      boardWorldPos.y + 0.08,
-      boardWorldPos.z + HOLE_Z * Math.cos(this.boardGroup.rotation.x)
-    );
+    const boardWorldQuat = new THREE.Quaternion();
+    this.boardGroup.getWorldQuaternion(boardWorldQuat);
 
-    const holeDist = Math.hypot(body.position.x - holeWorldPos.x, body.position.z - holeWorldPos.z);
-    const nearBoardTop = body.position.y < boardWorldPos.y + 0.55;
+    const currentPos = new THREE.Vector3(body.position.x, body.position.y, body.position.z);
+    const prevPos = this.bagPrevPositions[index];
 
-    // With the physical hole gap, the bag naturally falls through.
-    // Detect when the bag center is within the hole radius and near/below the board surface.
-    // Also detect bags that have already fallen below the board (fell through the gap).
-    const belowBoard = body.position.y < boardWorldPos.y - 0.15;
-    const enteringHole = nearBoardTop && holeDist < HOLE_RADIUS * 0.85;
-    const fellThrough = belowBoard && holeDist < HOLE_RADIUS + BAG_SIZE * 0.3;
+    // Track previous position for trajectory crossing detection
+    this.bagPrevPositions[index].copy(currentPos);
 
-    if (enteringHole || fellThrough) {
-      // Record first detection time
+    // If we don't have a valid previous position, skip this frame
+    if (prevPos.length() === 0) return;
+
+    // Transform positions to board-local space to account for tilt
+    const currentLocal = currentPos.clone().sub(boardWorldPos).applyQuaternion(boardWorldQuat.clone().invert());
+    const prevLocal = prevPos.clone().sub(boardWorldPos).applyQuaternion(boardWorldQuat.clone().invert());
+
+    // In board-local space, the hole is at (0, 0, HOLE_Z) and the board surface is at y = BOARD_THICKNESS/2
+    const holeLocalZ = HOLE_Z;
+    const holeLocalDist = Math.hypot(currentLocal.x, currentLocal.z - holeLocalZ);
+    const prevHoleLocalDist = Math.hypot(prevLocal.x, prevLocal.z - holeLocalZ);
+
+    // Check if bag crossed the board surface plane in local Y
+    const boardSurfaceY = BOARD_THICKNESS / 2;
+    const aboveBoard = currentLocal.y > boardSurfaceY;
+    const prevAboveBoard = prevLocal.y > boardSurfaceY;
+
+    // Detect crossing from above the board surface to below it while within hole radius
+    const crossedBoardPlane = prevAboveBoard && !aboveBoard;
+    const withinHoleRadius = holeLocalDist < HOLE_RADIUS * 0.75 || prevHoleLocalDist < HOLE_RADIUS * 0.75;
+
+    // Also detect bags that have already fallen below the board surface and are within radius
+    const belowBoard = !aboveBoard && holeLocalDist < HOLE_RADIUS * 0.75;
+
+    if ((crossedBoardPlane && withinHoleRadius) || belowBoard) {
+      this.bagInHole[index] = true;
+      // Set detection time for cleanup delay
       if (this.bagInHoleDetectedAt[index] === 0) {
         this.bagInHoleDetectedAt[index] = this.totalTime;
       }
-
-      // Adaptive delay: faster bags need less time to confirm (prevents swish misses)
-      const downwardSpeed = Math.abs(body.velocity.y);
-      const requiredDelay = THREE.MathUtils.clamp(0.15 - downwardSpeed * 0.03, 0.02, 0.15);
-
-      // Only register as cornhole after continuous detection (prevents bounce false positives)
-      if (this.totalTime - this.bagInHoleDetectedAt[index] > requiredDelay) {
-        this.bagInHole[index] = true;
+      // Play cornhole sound once when first detected
+      if (!this.cornholeSoundPlayed[index]) {
+        this.playCornholeSound();
+        this.cornholeSoundPlayed[index] = true;
       }
-    } else {
-      // Reset detection time if bag moves out of hole
-      this.bagInHoleDetectedAt[index] = 0;
     }
   }
 
-  finalizeBagInHole(_index: number) {
-    // No-op - bags now fall through naturally without cleanup
+  finalizeBagInHole(index: number) {
+    // Clear bags from hole after they've been counted for 5 seconds to prevent clogging
+    if (!this.bagInHole[index]) return;
+    if (this.bagPendingHoleCleanup[index]) return;
+
+    const timeSinceDetection = this.totalTime - this.bagInHoleDetectedAt[index];
+    if (timeSinceDetection > 5.0) {
+      // Mark for cleanup and remove from physics world
+      this.bagPendingHoleCleanup[index] = true;
+      this.bagHoleCleanupReadyAt[index] = this.totalTime;
+
+      const body = this.bagBodies[index];
+      const mesh = this.bags[index];
+
+      // Remove from physics world
+      if (body) {
+        this.world.removeBody(body);
+      }
+
+      // Hide the mesh
+      if (mesh) {
+        mesh.visible = false;
+      }
+    }
   }
 
   // ====== INPUT ======
@@ -3491,6 +3628,9 @@ export class CornholeGame {
     this.bagInHoleDetectedAt.fill(0);
     this.bagPendingHoleCleanup.fill(false);
     this.bagHoleCleanupReadyAt.fill(0);
+    for (let i = 0; i < 8; i++) {
+      this.bagPrevPositions[i].set(0, 0, 0);
+    }
     this.startTurn(1);
     this.emitState();
   }
