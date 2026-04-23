@@ -296,7 +296,8 @@ export class CornholeGame {
 
   // Callbacks
   onStateChange: (state: GameState) => void;
-  onScoreUpdate: (points: number, result: string) => void;
+  onScoreUpdate: (points: number, result: string, player: 1 | 2, inning: number) => void;
+  onInningComplete: ((inning: number, player1Points: number, player2Points: number) => void) | null = null;
 
   // Particles
   particleSystems: { points: THREE.Points; velocities: THREE.Vector3[]; life: number }[] = [];
@@ -306,6 +307,9 @@ export class CornholeGame {
   audioContext: AudioContext | null = null;
   cornholeSoundPlayed: boolean[] = Array(8).fill(false);
   pointSoundPlayed: boolean[] = Array(8).fill(false);
+  impactSoundPlayed: boolean[] = Array(8).fill(false);
+  boardHitSounds: AudioBuffer[] = [];
+  cornholeSounds: AudioBuffer[] = [];
 
   // Hole detection - track previous positions for trajectory crossing
   bagPrevPositions: THREE.Vector3[] = Array(8).fill(null).map(() => new THREE.Vector3());
@@ -322,7 +326,7 @@ export class CornholeGame {
   constructor(
     canvas: HTMLCanvasElement,
     onStateChange: (state: GameState) => void,
-    onScoreUpdate: (points: number, result: string) => void
+    onScoreUpdate: (points: number, result: string, player: 1 | 2, inning: number) => void
   ) {
     this.onStateChange = onStateChange;
     this.onScoreUpdate = onScoreUpdate;
@@ -413,7 +417,7 @@ export class CornholeGame {
     this.createEnvironment();
     this.createPullLine();
     this.createBagPreview();
-    this.initAudio();
+    this.initAudio(); // Load audio files asynchronously
     this.startTurn(1);
 
     window.addEventListener('resize', this.handleResize);
@@ -778,6 +782,53 @@ export class CornholeGame {
     this.world.addBody(this.boardBody);
   }
 
+  // Prevent bags from catching on the edges of the physics hole cutout.
+  // The physics hole is a square (front/back sections + left/right strips),
+  // but the visual hole is circular. Bags whose centers are within the hole's
+  // circular radius should pass through cleanly, even if part of their volume
+  // is still overlapping the square's strip edges that bound the cutout.
+  suppressBagHoleRimBounce() {
+    const boardWorldPos = new THREE.Vector3();
+    this.boardGroup.getWorldPosition(boardWorldPos);
+    const boardWorldQuat = new THREE.Quaternion();
+    this.boardGroup.getWorldQuaternion(boardWorldQuat);
+    const invBoardQuat = boardWorldQuat.clone().invert();
+    const tmp = new THREE.Vector3();
+
+    for (let i = 0; i < this.bagBodies.length; i++) {
+      const bag = this.bagBodies[i];
+      // Check bag position in board-local space
+      tmp.set(bag.position.x, bag.position.y, bag.position.z);
+      tmp.sub(boardWorldPos).applyQuaternion(invBoardQuat);
+      const holeDist = Math.hypot(tmp.x, tmp.z - HOLE_Z);
+
+      // If the bag's center is within the hole circle, the bag should pass
+      // through cleanly. Zero out any board-outward (up along board normal)
+      // velocity the solver just applied from clipping into rim strip edges.
+      if (holeDist < HOLE_RADIUS) {
+        // Board's "up" normal in world space (Y axis rotated by board tilt)
+        const upLocal = new CANNON.Vec3(0, 1, 0);
+        const bq = new CANNON.Quaternion(
+          this.boardBody.quaternion.x,
+          this.boardBody.quaternion.y,
+          this.boardBody.quaternion.z,
+          this.boardBody.quaternion.w,
+        );
+        const upWorld = bq.vmult(upLocal);
+
+        const v = bag.velocity;
+        const vUp = v.x * upWorld.x + v.y * upWorld.y + v.z * upWorld.z;
+        // Only cancel upward (out of board) component. Keep downward momentum
+        // so the bag keeps falling into the hole.
+        if (vUp > 0) {
+          v.x -= vUp * upWorld.x;
+          v.y -= vUp * upWorld.y;
+          v.z -= vUp * upWorld.z;
+        }
+      }
+    }
+  }
+
   // Zero out the outward-normal velocity component when a bag contacts the
   // board's front face, so it drops instead of bouncing back toward the thrower.
   // Why: the front face is near-vertical; even with tiny restitution the solver
@@ -822,9 +873,35 @@ export class CornholeGame {
     }
   }
 
-  initAudio() {
+  async initAudio() {
     try {
       this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+
+      // Load board hit sounds
+      const soundFiles = ['bag-on-board-1.mp3', 'bag-on-board-2.mp3', 'bag-on-board-3.mp3'];
+      for (const file of soundFiles) {
+        try {
+          const response = await fetch(`/audio/${file}`);
+          const arrayBuffer = await response.arrayBuffer();
+          const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
+          this.boardHitSounds.push(audioBuffer);
+        } catch (e) {
+          console.warn(`Failed to load audio file: ${file}`, e);
+        }
+      }
+
+      // Load cornhole sounds
+      const cornholeFiles = ['cornhole-1.mp3', 'cornhole-2.mp3'];
+      for (const file of cornholeFiles) {
+        try {
+          const response = await fetch(`/audio/${file}`);
+          const arrayBuffer = await response.arrayBuffer();
+          const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
+          this.cornholeSounds.push(audioBuffer);
+        } catch (e) {
+          console.warn(`Failed to load audio file: ${file}`, e);
+        }
+      }
     } catch (e) {
       console.warn('Web Audio API not supported');
     }
@@ -836,42 +913,52 @@ export class CornholeGame {
       this.audioContext.resume();
     }
 
-    const ctx = this.audioContext;
-    const now = ctx.currentTime;
+    // Play a random cornhole sound if loaded, otherwise fall back to synthesized sound
+    if (this.cornholeSounds.length > 0) {
+      const randomSound = this.cornholeSounds[Math.floor(Math.random() * this.cornholeSounds.length)];
+      const source = this.audioContext.createBufferSource();
+      source.buffer = randomSound;
+      source.connect(this.audioContext.destination);
+      source.start(0);
+    } else {
+      // Fallback to synthesized sound if audio files aren't loaded
+      const ctx = this.audioContext;
+      const now = ctx.currentTime;
 
-    // Create a satisfying "swish + thud" sound for cornhole
-    // Noise burst for swish
-    const noiseBuffer = ctx.createBuffer(1, ctx.sampleRate * 0.15, ctx.sampleRate);
-    const noiseData = noiseBuffer.getChannelData(0);
-    for (let i = 0; i < noiseData.length; i++) {
-      noiseData[i] = Math.random() * 2 - 1;
+      // Create a satisfying "swish + thud" sound for cornhole
+      // Noise burst for swish
+      const noiseBuffer = ctx.createBuffer(1, ctx.sampleRate * 0.15, ctx.sampleRate);
+      const noiseData = noiseBuffer.getChannelData(0);
+      for (let i = 0; i < noiseData.length; i++) {
+        noiseData[i] = Math.random() * 2 - 1;
+      }
+      const noise = ctx.createBufferSource();
+      noise.buffer = noiseBuffer;
+      const noiseGain = ctx.createGain();
+      noiseGain.gain.setValueAtTime(0.3, now);
+      noiseGain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+      const noiseFilter = ctx.createBiquadFilter();
+      noiseFilter.type = 'bandpass';
+      noiseFilter.frequency.value = 800;
+      noise.connect(noiseFilter);
+      noiseFilter.connect(noiseGain);
+      noiseGain.connect(ctx.destination);
+      noise.start(now);
+      noise.stop(now + 0.15);
+
+      // Low thud for bag hitting bottom
+      const thudOsc = ctx.createOscillator();
+      thudOsc.type = 'sine';
+      thudOsc.frequency.setValueAtTime(150, now);
+      thudOsc.frequency.exponentialRampToValueAtTime(60, now + 0.2);
+      const thudGain = ctx.createGain();
+      thudGain.gain.setValueAtTime(0.4, now);
+      thudGain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+      thudOsc.connect(thudGain);
+      thudGain.connect(ctx.destination);
+      thudOsc.start(now);
+      thudOsc.stop(now + 0.3);
     }
-    const noise = ctx.createBufferSource();
-    noise.buffer = noiseBuffer;
-    const noiseGain = ctx.createGain();
-    noiseGain.gain.setValueAtTime(0.3, now);
-    noiseGain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
-    const noiseFilter = ctx.createBiquadFilter();
-    noiseFilter.type = 'bandpass';
-    noiseFilter.frequency.value = 800;
-    noise.connect(noiseFilter);
-    noiseFilter.connect(noiseGain);
-    noiseGain.connect(ctx.destination);
-    noise.start(now);
-    noise.stop(now + 0.15);
-
-    // Low thud for bag hitting bottom
-    const thudOsc = ctx.createOscillator();
-    thudOsc.type = 'sine';
-    thudOsc.frequency.setValueAtTime(150, now);
-    thudOsc.frequency.exponentialRampToValueAtTime(60, now + 0.2);
-    const thudGain = ctx.createGain();
-    thudGain.gain.setValueAtTime(0.4, now);
-    thudGain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
-    thudOsc.connect(thudGain);
-    thudGain.connect(ctx.destination);
-    thudOsc.start(now);
-    thudOsc.stop(now + 0.3);
   }
 
   playPointSound() {
@@ -880,21 +967,30 @@ export class CornholeGame {
       this.audioContext.resume();
     }
 
-    const ctx = this.audioContext;
-    const now = ctx.currentTime;
+    // Play a random board hit sound if loaded, otherwise fall back to synthesized sound
+    if (this.boardHitSounds.length > 0) {
+      const randomSound = this.boardHitSounds[Math.floor(Math.random() * this.boardHitSounds.length)];
+      const source = this.audioContext.createBufferSource();
+      source.buffer = randomSound;
+      source.connect(this.audioContext.destination);
+      source.start(0);
+    } else {
+      // Fallback to synthesized sound if audio files aren't loaded
+      const ctx = this.audioContext;
+      const now = ctx.currentTime;
 
-    // Create a light "tap" sound for landing on board
-    const osc = ctx.createOscillator();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(400, now);
-    osc.frequency.exponentialRampToValueAtTime(200, now + 0.1);
-    const gain = ctx.createGain();
-    gain.gain.setValueAtTime(0.2, now);
-    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start(now);
-    osc.stop(now + 0.15);
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(400, now);
+      osc.frequency.exponentialRampToValueAtTime(200, now + 0.1);
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.2, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.15);
+    }
   }
 
   createBags(material: CANNON.Material) {
@@ -1829,6 +1925,7 @@ export class CornholeGame {
     this.bagHoleCleanupReadyAt[idx] = 0;
     this.cornholeSoundPlayed[idx] = false;
     this.pointSoundPlayed[idx] = false;
+    this.impactSoundPlayed[idx] = false;
     this.bagPrevPositions[idx].set(0, 0, 0);
 
     const body = this.bagBodies[idx];
@@ -1949,11 +2046,6 @@ export class CornholeGame {
       result = '🎯 IN THE HOLE!';
     } else if (onBoardX && onBoardZ && onBoardY) {
       result = '✅ On the board!';
-      // Play point sound once when first detected on board
-      if (!this.pointSoundPlayed[bagIndex]) {
-        this.playPointSound();
-        this.pointSoundPlayed[bagIndex] = true;
-      }
     } else {
       result = '❌ Miss!';
     }
@@ -1975,7 +2067,7 @@ export class CornholeGame {
     this.currentTurnBagReady = false;
 
     this.syncBagsLeftState();
-    this.onScoreUpdate(awardedPoints, result);
+    this.onScoreUpdate(awardedPoints, result, throwingPlayer, this.state.inning);
 
     // Determine next player: alternate from whoever just threw
     const nextPlayer: 1 | 2 = throwingPlayer === 1 ? 2 : 1;
@@ -2004,9 +2096,15 @@ export class CornholeGame {
     this.inningBaseScores[1] = this.state.player1Score;
     this.inningBaseScores[2] = this.state.player2Score;
 
+    const completedInning = this.state.inning;
     this.state.inning++;
     this.state.bagsThisInning = 0;
     this.currentTurnBagReady = false;
+
+    // Notify UI of round results (post-cancellation points)
+    if (this.onInningComplete) {
+      this.onInningComplete(completedInning, canceledRoundScores.player1, canceledRoundScores.player2);
+    }
 
     // "Honor" — in online play, whoever scored points this inning starts the next one.
     // Ties preserve the current starter. Keeps hot-seat play unchanged (starter stays P1).
@@ -2343,6 +2441,14 @@ export class CornholeGame {
       visual.wobbleAxisZ = wobbleSeedZ / wobbleLength;
       visual.lastImpactAt = this.totalTime;
 
+      // Play impact sound when bag hits the board.
+      // Only for the actively-thrown bag so settled bags from prior throws
+      // don't trigger sounds during clearing/transitions.
+      if (onBoard && !this.impactSoundPlayed[index] && this.activeThrownBagIndex === index) {
+        this.playPointSound();
+        this.impactSoundPlayed[index] = true;
+      }
+
       // Per-vertex deformation: seed impact direction in bag-local space
       visual.deformAmount = Math.max(visual.deformAmount, THREE.MathUtils.lerp(0.3, 1.0, impactStrength));
       // Contact side: transform world down vector into bag-local space to find which face hit
@@ -2675,8 +2781,10 @@ export class CornholeGame {
       if (this.bagInHoleDetectedAt[index] === 0) {
         this.bagInHoleDetectedAt[index] = this.totalTime;
       }
-      // Play cornhole sound once when first detected
-      if (!this.cornholeSoundPlayed[index]) {
+      // Play cornhole sound once when first detected.
+      // Only for the actively-thrown bag so settled bags don't trigger sounds
+      // during clearing/transitions.
+      if (!this.cornholeSoundPlayed[index] && this.activeThrownBagIndex === index) {
         this.playCornholeSound();
         this.cornholeSoundPlayed[index] = true;
       }
@@ -2849,6 +2957,15 @@ export class CornholeGame {
 
     if (this.cinematicCameraEnabled && this.activeThrownBagIndex !== null && !this.state.isAiming) {
       const body = this.bagBodies[this.activeThrownBagIndex];
+      // Stop following once the bag passes the hole (overshoot). Keep the
+      // camera holding its current pose so it doesn't swing wildly to chase
+      // a missed bag hurtling into the distance.
+      const holeWorldZ = this.boardGroup.position.z + HOLE_Z * Math.cos(BOARD_TILT);
+      if (body.position.z < holeWorldZ) {
+        this.camera.position.copy(this.cameraPosition);
+        this.camera.lookAt(this.cameraLookTarget);
+        return;
+      }
       const followTarget = new THREE.Vector3(body.position.x, body.position.y + 0.05, body.position.z);
       const horizontalOffset = this.state.throwingPlayer === 1 ? -1.45 : 1.45;
       const desiredCameraPosition = new THREE.Vector3(
@@ -3392,6 +3509,7 @@ export class CornholeGame {
     if (!this.guestMode) {
       this.world.step(1 / 60, dt, 3);
       this.suppressFrontEdgeBounce();
+      this.suppressBagHoleRimBounce();
 
       // Handle settling timer (game-time based, respects slow motion)
       if (this.state.isSettling && this.activeThrownBagIndex !== null) {
