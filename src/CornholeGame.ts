@@ -6,10 +6,12 @@ const BOARD_W = 2.0;
 const BOARD_L = 4.0;
 const BOARD_THICKNESS = 0.28;
 const HOLE_RADIUS = 0.3;
-const HOLE_Z = -1.2; // hole position along board (local Z)
+const HOLE_Z = -1.25; // hole position along board (local Z)
 // Bag center must sink BELOW this board-local Y to register as a cornhole.
 // Lower (more negative) = bag has to go deeper before it counts.
 const HOLE_CAPTURE_Y = -0.05;
+const HOLE_CAPTURE_RADIUS = HOLE_RADIUS * 0.84;
+const HOLE_FUNNEL_RADIUS = HOLE_RADIUS * 0.96;
 const BOARD_TILT = 0.18;
 const FRONT_EDGE_TOP_HEIGHT = 0.26;
 const TOP_PANEL_THICKNESS = 0.06;
@@ -36,6 +38,13 @@ const PLAYER_DEFAULT_X: Record<1 | 2, number> = {
   1: -1.15,
   2: 1.15,
 };
+const BOARD_TEXTURE_FILES = [
+  '/audio/imgs/board-texture-1.png',
+  '/audio/imgs/board-texture-2.png',
+  '/audio/imgs/board-texture-3.png',
+  '/audio/imgs/board-texture-4.png',
+  '/audio/imgs/board-texture-5.png',
+] as const;
 
 // ====== PHYSICS MATERIAL CONSTANTS ======
 const FRICTION = {
@@ -166,6 +175,9 @@ export class CornholeGame {
   boardGroup!: THREE.Group;
   boardBody!: CANNON.Body;
   groundBody!: CANNON.Body;
+  boardTopMaterial!: THREE.MeshStandardMaterial;
+  boardTopTextures: THREE.Texture[] = [];
+  boardTextureIndex = 0;
   bags: THREE.Mesh[] = [];
   bagBodies: CANNON.Body[] = [];
   bagSides: BagSide[] = Array(8).fill('sticky');
@@ -284,6 +296,7 @@ export class CornholeGame {
   snapshotSeq = 0;
   onSnapshot: ((snapshot: import('./net/types').Snapshot) => void) | null = null;
   onLocalIntent: ((intent: import('./net/types').Intent) => void) | null = null;
+  suppressRemoteDragUntil = 0;
   // Unified broadcast throttle: at most one snapshot send per 50ms, no matter
   // which code path asks. Multiple requests within a window collapse into a
   // single trailing send where a queued FULL request wins over FLIGHT (we'd
@@ -320,6 +333,7 @@ export class CornholeGame {
   pointSoundPlayed: boolean[] = Array(8).fill(false);
   impactSoundPlayed: boolean[] = Array(8).fill(false);
   boardHitSounds: AudioBuffer[] = [];
+  bagOnBagSounds: AudioBuffer[] = [];
   cornholeSounds: AudioBuffer[] = [];
 
   // Hole detection - track previous positions for trajectory crossing
@@ -655,6 +669,11 @@ export class CornholeGame {
     this.boardGroup = new THREE.Group();
 
     const woodTex = this.createWoodTexture();
+    this.boardTopMaterial = new THREE.MeshStandardMaterial({
+      map: this.getBoardTopTexture(this.boardTextureIndex),
+      roughness: 0.72,
+      metalness: 0.02,
+    });
     const boardVisMat = new THREE.MeshStandardMaterial({
       map: woodTex,
       roughness: 0.65,
@@ -680,8 +699,9 @@ export class CornholeGame {
     });
     topPanelGeo.translate(0, 0, -TOP_PANEL_THICKNESS / 2);
     topPanelGeo.rotateX(Math.PI / 2);
+    this.normalizeBoardTopUvs(topPanelGeo);
     topPanelGeo.computeVertexNormals();
-    const topPanelMesh = new THREE.Mesh(topPanelGeo, boardVisMat);
+    const topPanelMesh = new THREE.Mesh(topPanelGeo, [this.boardTopMaterial, boardVisMat]);
     topPanelMesh.position.y = BOARD_THICKNESS / 2 - TOP_PANEL_THICKNESS / 2;
     topPanelMesh.castShadow = true;
     topPanelMesh.receiveShadow = true;
@@ -730,10 +750,10 @@ export class CornholeGame {
     this.boardGroup.add(rim);
 
     // Debug: visualize the hole collider used for cornhole detection.
-    // Detection fires when a bag's center is within HOLE_RADIUS * 0.75 in
+    // Detection fires when a bag's center is within HOLE_CAPTURE_RADIUS in
     // board-local XZ AND has sunk below the HOLE_CAPTURE_Y plane.
     const debugGroup = new THREE.Group();
-    const debugRadius = HOLE_RADIUS * 0.75;
+    const debugRadius = HOLE_CAPTURE_RADIUS;
     const debugCylBottomY = HOLE_CAPTURE_Y - BAG_SIZE * 1.2;
     const debugCylHeight = HOLE_CAPTURE_Y - debugCylBottomY;
     const debugMat = new THREE.MeshBasicMaterial({
@@ -879,6 +899,64 @@ export class CornholeGame {
     }
   }
 
+  applyHoleCaptureAssist(dt: number) {
+    const boardWorldPos = new THREE.Vector3();
+    this.boardGroup.getWorldPosition(boardWorldPos);
+    const boardWorldQuat = new THREE.Quaternion();
+    this.boardGroup.getWorldQuaternion(boardWorldQuat);
+    const invBoardQuat = boardWorldQuat.clone().invert();
+    const localPos = new THREE.Vector3();
+    const localVel = new THREE.Vector3();
+    const boardTopY = BOARD_THICKNESS / 2;
+
+    for (let i = 0; i < this.bagBodies.length; i++) {
+      if (!this.bags[i]?.visible || this.bagInHole[i]) continue;
+
+      const body = this.bagBodies[i];
+      localPos.set(body.position.x, body.position.y, body.position.z)
+        .sub(boardWorldPos)
+        .applyQuaternion(invBoardQuat);
+
+      const holeDx = localPos.x;
+      const holeDz = localPos.z - HOLE_Z;
+      const holeDist = Math.hypot(holeDx, holeDz);
+      if (holeDist > HOLE_FUNNEL_RADIUS) continue;
+
+      const nearBoardSurface = localPos.y < boardTopY + BAG_SIZE * 0.65
+        && localPos.y > HOLE_CAPTURE_Y - BAG_SIZE * 0.4;
+      if (!nearBoardSurface) continue;
+
+      const rawAssist = THREE.MathUtils.clamp(
+        (HOLE_FUNNEL_RADIUS - holeDist) / (HOLE_FUNNEL_RADIUS - HOLE_CAPTURE_RADIUS * 0.5),
+        0,
+        1,
+      );
+      const assist = rawAssist * rawAssist * rawAssist;
+
+      localVel.set(body.velocity.x, body.velocity.y, body.velocity.z).applyQuaternion(invBoardQuat);
+      const centering = (1.65 + assist * 3.15) * assist * dt;
+      localVel.x += -holeDx * centering;
+      localVel.z += -holeDz * centering;
+
+      // The visible bag can compress through a round hole, but the physics body
+      // is a rigid box. Pull centered bags down through the artificial rim so
+      // they do not hover on the hidden rectangular collision strips.
+      if (localVel.y > 0) localVel.y *= 0.18;
+      const targetSinkSpeed = THREE.MathUtils.lerp(0.21, 0.94, assist);
+      if (-localVel.y < targetSinkSpeed) {
+        localVel.y = -targetSinkSpeed;
+      }
+
+      localVel.applyQuaternion(boardWorldQuat);
+      body.velocity.set(localVel.x, localVel.y, localVel.z);
+      body.angularVelocity.scale(THREE.MathUtils.clamp(1 - assist * 4 * dt, 0.68, 1), body.angularVelocity);
+
+      if (holeDist < HOLE_CAPTURE_RADIUS && localPos.y < boardTopY + BAG_SIZE * 0.34) {
+        this.markBagInHole(i, boardWorldQuat);
+      }
+    }
+  }
+
   // Zero out the outward-normal velocity component when a bag contacts the
   // board's front face, so it drops instead of bouncing back toward the thrower.
   // Why: the front face is near-vertical; even with tiny restitution the solver
@@ -935,6 +1013,25 @@ export class CornholeGame {
           const arrayBuffer = await response.arrayBuffer();
           const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
           this.boardHitSounds.push(audioBuffer);
+        } catch (e) {
+          console.warn(`Failed to load audio file: ${file}`, e);
+        }
+      }
+
+      // Load bag-on-bag impact sounds
+      const bagOnBagFiles = [
+        'bag-on-bag-1.mp3',
+        'bag-on-bag-2.mp3',
+        'bag-on-bag-3.mp3',
+        'bag-on-bag-4.mp3',
+        'bag-on-bag-5.mp3',
+      ];
+      for (const file of bagOnBagFiles) {
+        try {
+          const response = await fetch(`/audio/${file}`);
+          const arrayBuffer = await response.arrayBuffer();
+          const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
+          this.bagOnBagSounds.push(audioBuffer);
         } catch (e) {
           console.warn(`Failed to load audio file: ${file}`, e);
         }
@@ -1008,6 +1105,36 @@ export class CornholeGame {
       thudGain.connect(ctx.destination);
       thudOsc.start(now);
       thudOsc.stop(now + 0.3);
+    }
+  }
+
+  playBagOnBagSound() {
+    if (!this.audioContext) return;
+    if (this.audioContext.state === 'suspended') {
+      this.audioContext.resume();
+    }
+
+    if (this.bagOnBagSounds.length > 0) {
+      const randomSound = this.bagOnBagSounds[Math.floor(Math.random() * this.bagOnBagSounds.length)];
+      const source = this.audioContext.createBufferSource();
+      source.buffer = randomSound;
+      source.connect(this.audioContext.destination);
+      source.start(0);
+    } else {
+      const ctx = this.audioContext;
+      const now = ctx.currentTime;
+
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(210, now);
+      osc.frequency.exponentialRampToValueAtTime(85, now + 0.12);
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.22, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.16);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.16);
     }
   }
 
@@ -1822,6 +1949,44 @@ export class CornholeGame {
     return tex;
   }
 
+  getBoardTopTexture(index: number): THREE.Texture {
+    if (this.boardTopTextures[index]) return this.boardTopTextures[index];
+
+    const file = BOARD_TEXTURE_FILES[index] ?? BOARD_TEXTURE_FILES[0];
+    const tex = new THREE.TextureLoader().load(file);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+    this.boardTopTextures[index] = tex;
+    return tex;
+  }
+
+  cycleBoardTexture() {
+    this.boardTextureIndex = (this.boardTextureIndex + 1) % BOARD_TEXTURE_FILES.length;
+    if (this.boardTopMaterial) {
+      this.boardTopMaterial.map = this.getBoardTopTexture(this.boardTextureIndex);
+      this.boardTopMaterial.needsUpdate = true;
+    }
+    this.state.message = `Board texture ${this.boardTextureIndex + 1}/${BOARD_TEXTURE_FILES.length}`;
+    this.emitState();
+  }
+
+  normalizeBoardTopUvs(geometry: THREE.BufferGeometry) {
+    const pos = geometry.attributes.position as THREE.BufferAttribute;
+    const uv = geometry.attributes.uv as THREE.BufferAttribute | undefined;
+    if (!uv) return;
+
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i);
+      const z = pos.getZ(i);
+      const u = THREE.MathUtils.clamp((x + BOARD_W / 2) / BOARD_W, 0, 1);
+      const v = THREE.MathUtils.clamp(1 - (z + BOARD_L / 2) / BOARD_L, 0, 1);
+      uv.setXY(i, u, v);
+    }
+    uv.needsUpdate = true;
+  }
+
   createFabricTexture(color: number): THREE.CanvasTexture {
     const c = document.createElement('canvas');
     c.width = 128;
@@ -2084,6 +2249,7 @@ export class CornholeGame {
     const body = this.bagBodies[idx];
     const mesh = this.bags[idx];
     this.resetBagVisualState(idx);
+    body.collisionResponse = true;
 
     // Ensure body is in the physics world (it may have been removed by hole cleanup)
     if (!this.world.bodies.includes(body)) {
@@ -2323,6 +2489,7 @@ export class CornholeGame {
       this.bagBodies[i].position.set(0, -20, 0);
       this.bagBodies[i].velocity.set(0, 0, 0);
       this.bagBodies[i].angularVelocity.set(0, 0, 0);
+      this.bagBodies[i].collisionResponse = true;
       this.resetBagVisualState(i);
     }
     this.bagThrowStyles.fill('slide');
@@ -2546,6 +2713,34 @@ export class CornholeGame {
       }
       // Heavy angular damping while tipping so we never build spin that overshoots flat.
       body.angularDamping = 0.92;
+    }
+  }
+
+  playActiveBagOnBagImpactSound() {
+    const activeIndex = this.activeThrownBagIndex;
+    if (activeIndex === null) return;
+    if (!this.state.isThrowing && !this.state.isSettling) return;
+    if (this.impactSoundPlayed[activeIndex]) return;
+    if (!this.bags[activeIndex]?.visible) return;
+
+    const activeBody = this.bagBodies[activeIndex];
+    if (!activeBody) return;
+
+    for (const contact of this.world.contacts) {
+      const otherBody = contact.bi === activeBody
+        ? contact.bj
+        : contact.bj === activeBody
+          ? contact.bi
+          : null;
+      if (!otherBody) continue;
+
+      const otherBagIndex = this.bagBodies.indexOf(otherBody);
+      if (otherBagIndex < 0 || otherBagIndex === activeIndex) continue;
+      if (!this.bags[otherBagIndex]?.visible && !this.bagInHole[otherBagIndex]) continue;
+
+      this.playBagOnBagSound();
+      this.impactSoundPlayed[activeIndex] = true;
+      return;
     }
   }
 
@@ -2889,6 +3084,42 @@ export class CornholeGame {
     visual.lastVelocityY = body.velocity.y;
   }
 
+  markBagInHole(index: number, boardWorldQuat?: THREE.Quaternion) {
+    if (this.bagInHole[index]) return;
+
+    this.bagInHole[index] = true;
+    if (this.bagInHoleDetectedAt[index] === 0) {
+      this.bagInHoleDetectedAt[index] = Math.max(this.totalTime, 0.001);
+    }
+
+    const body = this.bagBodies[index];
+    body.collisionResponse = false;
+
+    const quat = boardWorldQuat ?? (() => {
+      const q = new THREE.Quaternion();
+      this.boardGroup.getWorldQuaternion(q);
+      return q;
+    })();
+    const downWorld = new THREE.Vector3(0, -1, 0).applyQuaternion(quat);
+    const currentDownSpeed = body.velocity.x * downWorld.x
+      + body.velocity.y * downWorld.y
+      + body.velocity.z * downWorld.z;
+    const targetDownSpeed = 1.8;
+    if (currentDownSpeed < targetDownSpeed) {
+      const boost = targetDownSpeed - currentDownSpeed;
+      body.velocity.x += downWorld.x * boost;
+      body.velocity.y += downWorld.y * boost;
+      body.velocity.z += downWorld.z * boost;
+    }
+
+    // Play cornhole sound once when first detected. Only for the actively-thrown
+    // bag so settled bags don't trigger sounds during clearing/transitions.
+    if (!this.cornholeSoundPlayed[index] && this.activeThrownBagIndex === index) {
+      this.playCornholeSound();
+      this.cornholeSoundPlayed[index] = true;
+    }
+  }
+
   captureBagInHole(index: number) {
     if (this.bagInHole[index]) return;
 
@@ -2924,24 +3155,13 @@ export class CornholeGame {
 
     // Detect crossing from above the board surface to below it while within hole radius
     const crossedBoardPlane = prevAboveBoard && !aboveBoard;
-    const withinHoleRadius = holeLocalDist < HOLE_RADIUS * 0.75 || prevHoleLocalDist < HOLE_RADIUS * 0.75;
+    const withinHoleRadius = holeLocalDist < HOLE_CAPTURE_RADIUS || prevHoleLocalDist < HOLE_CAPTURE_RADIUS;
 
     // Also detect bags that have already fallen below the board surface and are within radius
-    const belowBoard = !aboveBoard && holeLocalDist < HOLE_RADIUS * 0.75;
+    const belowBoard = !aboveBoard && holeLocalDist < HOLE_CAPTURE_RADIUS;
 
     if ((crossedBoardPlane && withinHoleRadius) || belowBoard) {
-      this.bagInHole[index] = true;
-      // Set detection time for cleanup delay
-      if (this.bagInHoleDetectedAt[index] === 0) {
-        this.bagInHoleDetectedAt[index] = this.totalTime;
-      }
-      // Play cornhole sound once when first detected.
-      // Only for the actively-thrown bag so settled bags don't trigger sounds
-      // during clearing/transitions.
-      if (!this.cornholeSoundPlayed[index] && this.activeThrownBagIndex === index) {
-        this.playCornholeSound();
-        this.cornholeSoundPlayed[index] = true;
-      }
+      this.markBagInHole(index, boardWorldQuat);
     }
   }
 
@@ -3236,7 +3456,16 @@ export class CornholeGame {
     if (this.guestMode) {
       const ndc = this.getPointerNdc(event);
       this.dragCurrent.copy(ndc);
+      this.updateAimFromDrag();
+      const dragDistance = this.getCurrentDragDistance();
+      const shouldThrow = dragDistance >= MIN_THROW_DRAG_DISTANCE && this.pullDistance > 0.2;
       this.isDragging = false;
+      this.clearDragGuide();
+      if (!shouldThrow) {
+        this.state.message = 'Pull farther for more distance.';
+      }
+      this.suppressRemoteDragUntil = performance.now() + 1200;
+      this.emitState();
       // Send the guest's locally-oscillated aimPower with the release so the
       // host throws with the same sin value the guest actually saw when
       // releasing — otherwise the host's own oscillator (a ~100ms-different
@@ -3275,6 +3504,13 @@ export class CornholeGame {
 
     if (this.guestMode) {
       this.isDragging = false;
+      this.clearDragGuide();
+      this.state.message = 'Pull for distance, release to lock speed.';
+      this.aimX = 0;
+      this.pullDistance = 0.3;
+      this.aimPower = 0.65;
+      this.suppressRemoteDragUntil = performance.now() + 1200;
+      this.emitState();
       this.onLocalIntent?.({ type: 'dragCancel' });
       return;
     }
@@ -3318,6 +3554,10 @@ export class CornholeGame {
         return;
       } else if (event.code === 'KeyW' && !event.repeat) {
         this.onLocalIntent?.({ type: 'toggleWeather' });
+        event.preventDefault();
+        return;
+      } else if (event.code === 'KeyB' && !event.repeat) {
+        this.cycleBoardTexture();
         event.preventDefault();
         return;
       } else if (event.code === 'KeyC' && !event.repeat && !this.isDragging) {
@@ -3383,6 +3623,9 @@ export class CornholeGame {
     } else if (event.code === 'KeyW' && !event.repeat) {
       this.weatherEnabled = !this.weatherEnabled;
       this.emitState();
+      event.preventDefault();
+    } else if (event.code === 'KeyB' && !event.repeat) {
+      this.cycleBoardTexture();
       event.preventDefault();
     } else if (event.code === 'KeyS' && !event.repeat) {
       this.slowMotionEnabled = !this.slowMotionEnabled;
@@ -3664,6 +3907,8 @@ export class CornholeGame {
       this.world.step(1 / 60, dt, 3);
       this.suppressFrontEdgeBounce();
       this.suppressBagHoleRimBounce();
+      this.applyHoleCaptureAssist(dt);
+      this.playActiveBagOnBagImpactSound();
       this.syncPhysicsDebugMeshes();
 
       // Handle settling timer (game-time based, respects slow motion)
@@ -3833,6 +4078,9 @@ export class CornholeGame {
       this.previewBag.geometry.dispose();
       this.disposeBagMaterials(this.previewBag.material as THREE.Material | THREE.Material[]);
     }
+    for (const texture of this.boardTopTextures) {
+      texture?.dispose();
+    }
     this.renderer.dispose();
   }
 
@@ -3893,6 +4141,7 @@ export class CornholeGame {
         this.bagBodies[i].position.set(0, -20, 0);
         this.bagBodies[i].velocity.set(0, 0, 0);
         this.bagBodies[i].angularVelocity.set(0, 0, 0);
+        this.bagBodies[i].collisionResponse = true;
       }
       this.resetBagVisualState(i);
     }
@@ -4111,6 +4360,13 @@ export class CornholeGame {
     const preservedDragCurrent = this.dragCurrent.clone();
     const preservedThrowDistanceFeet = this.state.throwDistanceFeet;
     const preservedMessage = this.state.message;
+    const suppressStaleRemoteDrag =
+      this.localPlayerSlot === this.state.currentPlayer &&
+      !this.isDragging &&
+      performance.now() < this.suppressRemoteDragUntil &&
+      snapshot.state.isAiming &&
+      !snapshot.state.isThrowing &&
+      snapshot.state.isDragging;
 
     this.state = { ...snapshot.state };
     this.playerX = snapshot.playerX;
@@ -4132,6 +4388,11 @@ export class CornholeGame {
     this.dragStart.set(snapshot.state.dragStartX * 2 - 1, 1 - snapshot.state.dragStartY * 2);
     this.dragCurrent.set(snapshot.state.dragCurrentX * 2 - 1, 1 - snapshot.state.dragCurrentY * 2);
     this.isDragging = snapshot.state.isDragging;
+
+    if (suppressStaleRemoteDrag) {
+      this.isDragging = false;
+      this.clearDragGuide();
+    }
 
     if (guestOwnsAim) {
       // Guest's local aim oscillator is authoritative for the power bar when

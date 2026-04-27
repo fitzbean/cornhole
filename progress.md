@@ -59,3 +59,12 @@ Original prompt: Change the throw mechanic to a slingshot type of mechanic where
 - Build validation rerun through local Vite entrypoint because PowerShell blocks npm.ps1 on this machine.
 - TypeScript API verification passed after the gameplay/UI updates.
 - Full Vite build/browser verification remains unconfirmed in this run because subprocess-based tooling is blocked in sandbox and elevation was declined.
+- Investigating player 2 multiplayer aim UI sticking after click-without-drag; found guest release/cancel paths were not clearing local `state.isDragging` or emitting local state before waiting for the host snapshot.
+- Patched guest mouseup/mouseleave handling to clear the drag guide and emit state immediately, matching player 1/local behavior.
+- Verification: `node node_modules/typescript/bin/tsc --noEmit` passed. `node node_modules/vite/bin/vite.js build` hit sandbox `spawn EPERM`; elevated rerun was declined, so browser/Playwright verification remains blocked in this session.
+- Follow-up after user reported it still happened: added a guest-side stale snapshot guard so late host `dragStart` snapshots cannot resurrect `isDragging` after player 2 has already released/canceled locally. `node node_modules/typescript/bin/tsc --noEmit` passed again.
+- Loaded the `bag-on-bag-*.mp3` assets and added active-thrown-bag contact detection so first impact against another visible bag plays bag-on-bag audio and marks `impactSoundPlayed` true before board audio can fire.
+- Verification: `.\\node_modules\\.bin\\tsc.cmd --noEmit` passed. `npm.cmd run build` still hits sandbox `spawn EPERM`; elevated rerun was declined, so full Vite/browser audio verification remains unconfirmed.
+- Added five numbered board top textures and a `B` key toggle that cycles the top-panel material while leaving the board sides/aprons on the generated wood texture. TypeScript verification passed.
+- Investigated bags appearing to float over the hole; root cause is the rigid box bag colliding with hidden rectangular board strips around the visual circular hole. Added a hole funnel/capture assist that pulls centered bags through, disables collision response once captured, and restores collision response before reuse. TypeScript verification passed.
+- Retuned the hole funnel so it does not feel like suction: smaller assist radius, cubic ramp near center, weaker centering, and lower sink speed. TypeScript verification passed.
