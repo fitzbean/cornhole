@@ -64,6 +64,7 @@ function App() {
   const [power, setPower] = useState(65);
   const [scoreHighlightPlayer, setScoreHighlightPlayer] = useState<0 | 1 | 2>(0);
   const [cinematicCameraEnabled, setCinematicCameraEnabled] = useState(false);
+  const [holeColliderDebugVisible, setHoleColliderDebugVisible] = useState(false);
   const [hasStartedGame, setHasStartedGame] = useState(false);
   const [gameSession, setGameSession] = useState(0);
   const [gameInstance, setGameInstance] = useState<CornholeGame | null>(null);
@@ -91,33 +92,24 @@ function App() {
     setPower(Math.round(state.aimPower * 100));
   }, []);
 
-  type ScoreLogEntry =
-    | { kind: 'throw'; id: number; player: 1 | 2; points: number; result: string; inning: number }
-    | { kind: 'summary'; id: number; inning: number; player1Points: number; player2Points: number };
+  type ScoreLogEntry = {
+    id: number;
+    inning: number;
+    player1Points: number;
+    player2Points: number;
+  };
 
   const [scoreLog, setScoreLog] = useState<ScoreLogEntry[]>([]);
   const scoreLogIdRef = useRef(0);
 
-  const handleScoreUpdate = useCallback(
-    (points: number, result: string, player: 1 | 2, inning: number) => {
-      scoreLogIdRef.current += 1;
-      const id = scoreLogIdRef.current;
-      setScoreLog((prev) =>
-        [{ kind: 'throw' as const, id, player, points, result, inning }, ...prev].slice(0, 50)
-      );
-    },
-    []
-  );
+  const handleScoreUpdate = useCallback(() => {}, []);
 
   const handleInningComplete = useCallback(
     (inning: number, player1Points: number, player2Points: number) => {
       scoreLogIdRef.current += 1;
       const id = scoreLogIdRef.current;
       setScoreLog((prev) =>
-        [
-          { kind: 'summary' as const, id, inning, player1Points, player2Points },
-          ...prev,
-        ].slice(0, 50)
+        [{ id, inning, player1Points, player2Points }, ...prev].slice(0, 50)
       );
     },
     []
@@ -130,6 +122,7 @@ function App() {
     const game = new CornholeGame(canvas, handleStateChange, handleScoreUpdate);
     game.onInningComplete = handleInningComplete;
     game.setCinematicCameraEnabled(cinematicCameraEnabled);
+    game.setHoleColliderDebugVisible(holeColliderDebugVisible);
     game.setupControls(canvas);
 
     gameRef.current = game;
@@ -145,6 +138,10 @@ function App() {
   useEffect(() => {
     gameRef.current?.setCinematicCameraEnabled(cinematicCameraEnabled);
   }, [cinematicCameraEnabled]);
+
+  useEffect(() => {
+    gameRef.current?.setHoleColliderDebugVisible(holeColliderDebugVisible);
+  }, [holeColliderDebugVisible]);
 
   useEffect(() => {
     if (!gameState.gameOver) {
@@ -583,66 +580,48 @@ function App() {
         <div className="flex items-center justify-between border-b border-white/10 px-4 py-2">
           <span className="text-[11px] font-bold uppercase tracking-[0.24em] text-white/75">Match Log</span>
           <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/40">
-            {scoreLog.filter((e) => e.kind === 'throw').length} bags
+            {scoreLog.length} {scoreLog.length === 1 ? 'round' : 'rounds'}
           </span>
         </div>
         <div className="flex-1 overflow-y-auto px-2 py-1.5 text-[11px] font-medium text-white/80">
           {scoreLog.length === 0 ? (
             <div className="px-2 py-3 text-center text-[11px] font-semibold uppercase tracking-[0.18em] text-white/35">
-              No throws yet
+              No rounds yet
             </div>
           ) : (
             scoreLog.map((entry) => {
-              if (entry.kind === 'summary') {
-                const p1 = entry.player1Points;
-                const p2 = entry.player2Points;
-                const winner: 1 | 2 | null = p1 > p2 ? 1 : p2 > p1 ? 2 : null;
-                const points = winner === 1 ? p1 : winner === 2 ? p2 : 0;
-                const badgeColor = winner === 1
-                  ? 'border-red-400/40 bg-red-500/15 text-red-200'
-                  : winner === 2
-                    ? 'border-blue-400/40 bg-blue-500/15 text-blue-200'
-                    : 'border-white/25 bg-white/10 text-white/60';
-                const badgeLabel = winner === 1 ? 'P1' : winner === 2 ? 'P2' : '—';
-                return (
-                  <div
-                    key={entry.id}
-                    className="my-1 flex items-center gap-2 rounded-md border border-amber-300/25 bg-amber-300/10 px-2 py-1"
-                  >
-                    <span className="min-w-[34px] text-[10px] font-black uppercase tracking-[0.14em] text-amber-200/80">
-                      R{entry.inning}
-                    </span>
-                    <span className={`min-w-[46px] rounded border px-1.5 py-0.5 text-center text-[10px] font-bold uppercase tracking-[0.14em] ${badgeColor}`}>
-                      {badgeLabel}
-                    </span>
-                    <span className="flex-1 truncate font-bold uppercase tracking-[0.18em] text-amber-100">
-                      Scored
-                    </span>
-                    <span className={`min-w-[28px] text-right text-[12px] font-black tabular-nums ${points > 0 ? 'text-emerald-300' : 'text-white/40'}`}>
-                      +{points}
-                    </span>
-                  </div>
-                );
-              }
-              const isP1 = entry.player === 1;
-              const badgeColor = isP1
+              const p1 = entry.player1Points;
+              const p2 = entry.player2Points;
+              const winner: 1 | 2 | null = p1 > p2 ? 1 : p2 > p1 ? 2 : null;
+              const points = winner === 1 ? p1 : winner === 2 ? p2 : 0;
+              const isWash = winner === null;
+              const badgeColor = winner === 1
                 ? 'border-red-400/40 bg-red-500/15 text-red-200'
-                : 'border-blue-400/40 bg-blue-500/15 text-blue-200';
+                : winner === 2
+                  ? 'border-blue-400/40 bg-blue-500/15 text-blue-200'
+                  : 'border-white/25 bg-white/10 text-white/60';
+              const badgeLabel = winner === 1 ? 'P1' : winner === 2 ? 'P2' : '—';
               return (
                 <div
                   key={entry.id}
-                  className="flex items-center gap-2 rounded-md px-2 py-1 hover:bg-white/5"
+                  className="my-1 flex items-center gap-2 rounded-md px-2 py-1 hover:bg-white/5"
                 >
                   <span className="min-w-[34px] text-[10px] font-bold uppercase tracking-[0.14em] text-white/45">
                     R{entry.inning}
                   </span>
                   <span className={`min-w-[46px] rounded border px-1.5 py-0.5 text-center text-[10px] font-bold uppercase tracking-[0.14em] ${badgeColor}`}>
-                    {isP1 ? 'P1' : 'P2'}
+                    {badgeLabel}
                   </span>
-                  <span className="flex-1 truncate text-white/85">{entry.result}</span>
-                  <span className={`min-w-[28px] text-right text-[12px] font-black tabular-nums ${entry.points > 0 ? 'text-emerald-300' : 'text-white/40'}`}>
-                    +{entry.points}
-                  </span>
+                  <span className="flex-1" />
+                  {isWash ? (
+                    <span className="min-w-[44px] text-right text-[11px] font-black uppercase tracking-[0.14em] text-white/55">
+                      Wash
+                    </span>
+                  ) : (
+                    <span className="min-w-[28px] text-right text-[12px] font-black tabular-nums text-emerald-300">
+                      +{points}
+                    </span>
+                  )}
                 </div>
               );
             })
@@ -803,6 +782,18 @@ function App() {
           <span>
             <div className="text-xs font-bold uppercase tracking-wider text-gray-400">Cinematic Camera</div>
             <div className="text-[11px] text-gray-400">Follow the bag after release</div>
+          </span>
+        </label>
+        <label className="mb-3 flex cursor-pointer items-center gap-3 text-left">
+          <input
+            type="checkbox"
+            checked={holeColliderDebugVisible}
+            onChange={(event) => setHoleColliderDebugVisible(event.target.checked)}
+            className="h-4 w-4 rounded border-gray-500 bg-black/40 text-pink-400"
+          />
+          <span>
+            <div className="text-xs font-bold uppercase tracking-wider text-gray-400">Show Colliders</div>
+            <div className="text-[11px] text-gray-400">Debug: visualize all physics colliders + hole trigger</div>
           </span>
         </label>
         <div className="text-[11px] text-gray-400">Speed now appears above your pull point while aiming.</div>

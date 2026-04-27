@@ -7,6 +7,9 @@ const BOARD_L = 4.0;
 const BOARD_THICKNESS = 0.28;
 const HOLE_RADIUS = 0.3;
 const HOLE_Z = -1.2; // hole position along board (local Z)
+// Bag center must sink BELOW this board-local Y to register as a cornhole.
+// Lower (more negative) = bag has to go deeper before it counts.
+const HOLE_CAPTURE_Y = -0.05;
 const BOARD_TILT = 0.18;
 const FRONT_EDGE_TOP_HEIGHT = 0.26;
 const TOP_PANEL_THICKNESS = 0.06;
@@ -263,6 +266,14 @@ export class CornholeGame {
   freeRoamYaw = 0;
   freeRoamPitch = -0.18;
   cinematicCameraEnabled = false;
+  holeColliderDebug: THREE.Object3D | null = null;
+  physicsDebugGroup: THREE.Group | null = null;
+  physicsDebugVisible = false;
+  physicsDebugMeshes: Array<{
+    body: CANNON.Body;
+    shapeIndex: number;
+    mesh: THREE.Object3D;
+  }> = [];
   activeThrownBagIndex: number | null = null;
   slowMotionEnabled = false;
 
@@ -717,6 +728,45 @@ export class CornholeGame {
     rim.rotation.x = -Math.PI / 2;
     rim.position.set(0, BOARD_THICKNESS / 2 + 0.003, HOLE_Z);
     this.boardGroup.add(rim);
+
+    // Debug: visualize the hole collider used for cornhole detection.
+    // Detection fires when a bag's center is within HOLE_RADIUS * 0.75 in
+    // board-local XZ AND has sunk below the HOLE_CAPTURE_Y plane.
+    const debugGroup = new THREE.Group();
+    const debugRadius = HOLE_RADIUS * 0.75;
+    const debugCylBottomY = HOLE_CAPTURE_Y - BAG_SIZE * 1.2;
+    const debugCylHeight = HOLE_CAPTURE_Y - debugCylBottomY;
+    const debugMat = new THREE.MeshBasicMaterial({
+      color: 0xff3366,
+      transparent: true,
+      opacity: 0.22,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const debugCyl = new THREE.Mesh(
+      new THREE.CylinderGeometry(debugRadius, debugRadius, debugCylHeight, 32, 1, true),
+      debugMat,
+    );
+    debugCyl.position.set(0, debugCylBottomY + debugCylHeight / 2, HOLE_Z);
+    debugGroup.add(debugCyl);
+    // Trigger plane ring (sits at HOLE_CAPTURE_Y)
+    const debugRingMat = new THREE.MeshBasicMaterial({
+      color: 0xff3366,
+      transparent: true,
+      opacity: 0.85,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const debugRing = new THREE.Mesh(
+      new THREE.RingGeometry(debugRadius - 0.012, debugRadius + 0.012, 48),
+      debugRingMat,
+    );
+    debugRing.rotation.x = -Math.PI / 2;
+    debugRing.position.set(0, HOLE_CAPTURE_Y, HOLE_Z);
+    debugGroup.add(debugRing);
+    debugGroup.visible = false;
+    this.boardGroup.add(debugGroup);
+    this.holeColliderDebug = debugGroup;
 
     // Legs
     const legGeo = new THREE.BoxGeometry(REAR_LEG_THICKNESS, REAR_LEG_LENGTH, REAR_LEG_THICKNESS * 1.17);
@@ -1897,6 +1947,109 @@ export class CornholeGame {
     this.cinematicCameraEnabled = enabled;
   }
 
+  setHoleColliderDebugVisible(visible: boolean) {
+    if (this.holeColliderDebug) {
+      this.holeColliderDebug.visible = visible;
+    }
+    this.physicsDebugVisible = visible;
+    if (visible) {
+      this.buildPhysicsDebugMeshes();
+    }
+    if (this.physicsDebugGroup) {
+      this.physicsDebugGroup.visible = visible;
+    }
+  }
+
+  // Build (or rebuild) wireframe meshes for every shape on every physics body
+  // in the world. Bodies are lightweight enough to rebuild on toggle. Shape
+  // transforms are synced each frame in `syncPhysicsDebugMeshes`.
+  buildPhysicsDebugMeshes() {
+    if (!this.physicsDebugGroup) {
+      this.physicsDebugGroup = new THREE.Group();
+      this.physicsDebugGroup.renderOrder = 999;
+      this.scene.add(this.physicsDebugGroup);
+    }
+    // Clear previous meshes.
+    for (const entry of this.physicsDebugMeshes) {
+      this.physicsDebugGroup.remove(entry.mesh);
+      const m = entry.mesh as THREE.Mesh;
+      if (m.geometry) m.geometry.dispose();
+    }
+    this.physicsDebugMeshes = [];
+
+    const bagBodySet = new Set(this.bagBodies);
+    const colorFor = (body: CANNON.Body): number => {
+      if (body === this.boardBody) return 0x33ccff;
+      if (body === this.groundBody) return 0x66ff66;
+      if (bagBodySet.has(body)) return 0xffaa33;
+      return 0xff66cc;
+    };
+
+    for (const body of this.world.bodies) {
+      for (let s = 0; s < body.shapes.length; s++) {
+        const shape = body.shapes[s];
+        const color = colorFor(body);
+        const mat = new THREE.LineBasicMaterial({
+          color,
+          transparent: true,
+          opacity: 0.85,
+          depthTest: false,
+        });
+        let mesh: THREE.Object3D | null = null;
+        if (shape instanceof CANNON.Box) {
+          const he = shape.halfExtents;
+          const geo = new THREE.BoxGeometry(he.x * 2, he.y * 2, he.z * 2);
+          mesh = new THREE.LineSegments(new THREE.EdgesGeometry(geo), mat);
+          geo.dispose();
+        } else if (shape instanceof CANNON.Sphere) {
+          const geo = new THREE.SphereGeometry(shape.radius, 12, 8);
+          mesh = new THREE.LineSegments(new THREE.EdgesGeometry(geo), mat);
+          geo.dispose();
+        } else if (shape instanceof CANNON.Plane) {
+          // Infinite plane — draw a large grid-like quad.
+          const size = 50;
+          const geo = new THREE.PlaneGeometry(size, size);
+          mesh = new THREE.LineSegments(new THREE.EdgesGeometry(geo), mat);
+          geo.dispose();
+        } else if (shape instanceof CANNON.Cylinder) {
+          const geo = new THREE.CylinderGeometry(
+            shape.radiusTop,
+            shape.radiusBottom,
+            shape.height,
+            16,
+          );
+          mesh = new THREE.LineSegments(new THREE.EdgesGeometry(geo), mat);
+          geo.dispose();
+        }
+        if (!mesh) continue;
+        (mesh as THREE.LineSegments).renderOrder = 999;
+        this.physicsDebugGroup.add(mesh);
+        this.physicsDebugMeshes.push({ body, shapeIndex: s, mesh });
+      }
+    }
+  }
+
+  // Sync each debug mesh's transform to its physics body's current shape
+  // position/orientation (body transform composed with per-shape offset/quat).
+  syncPhysicsDebugMeshes() {
+    if (!this.physicsDebugVisible || !this.physicsDebugGroup) return;
+    const bodyPos = new THREE.Vector3();
+    const bodyQuat = new THREE.Quaternion();
+    const shapeOffset = new THREE.Vector3();
+    const shapeQuat = new THREE.Quaternion();
+    for (const entry of this.physicsDebugMeshes) {
+      const { body, shapeIndex, mesh } = entry;
+      bodyPos.set(body.position.x, body.position.y, body.position.z);
+      bodyQuat.set(body.quaternion.x, body.quaternion.y, body.quaternion.z, body.quaternion.w);
+      const so = body.shapeOffsets[shapeIndex];
+      const sq = body.shapeOrientations[shapeIndex];
+      shapeOffset.set(so.x, so.y, so.z).applyQuaternion(bodyQuat);
+      shapeQuat.set(sq.x, sq.y, sq.z, sq.w);
+      mesh.position.copy(bodyPos).add(shapeOffset);
+      mesh.quaternion.copy(bodyQuat).multiply(shapeQuat);
+    }
+  }
+
   throwBag() {
     if (this.state.isThrowing || this.state.isSettling || this.state.gameOver) return;
     if (!this.currentTurnBagReady) return;
@@ -2763,10 +2916,11 @@ export class CornholeGame {
     const holeLocalDist = Math.hypot(currentLocal.x, currentLocal.z - holeLocalZ);
     const prevHoleLocalDist = Math.hypot(prevLocal.x, prevLocal.z - holeLocalZ);
 
-    // Check if bag crossed the board surface plane in local Y
-    const boardSurfaceY = BOARD_THICKNESS / 2;
-    const aboveBoard = currentLocal.y > boardSurfaceY;
-    const prevAboveBoard = prevLocal.y > boardSurfaceY;
+    // Check if bag crossed the capture plane in local Y. This sits below the
+    // board surface so the bag has to actually sink into the hole to count.
+    const captureY = HOLE_CAPTURE_Y;
+    const aboveBoard = currentLocal.y > captureY;
+    const prevAboveBoard = prevLocal.y > captureY;
 
     // Detect crossing from above the board surface to below it while within hole radius
     const crossedBoardPlane = prevAboveBoard && !aboveBoard;
@@ -3510,6 +3664,7 @@ export class CornholeGame {
       this.world.step(1 / 60, dt, 3);
       this.suppressFrontEdgeBounce();
       this.suppressBagHoleRimBounce();
+      this.syncPhysicsDebugMeshes();
 
       // Handle settling timer (game-time based, respects slow motion)
       if (this.state.isSettling && this.activeThrownBagIndex !== null) {
