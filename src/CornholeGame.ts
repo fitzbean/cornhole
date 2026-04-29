@@ -186,6 +186,10 @@ export class CornholeGame {
   windVector = new THREE.Vector3(1, 0, 0);
   windDirection = 'E';
   weatherEnabled = true;
+  weatherEmitAccum = 0;
+  windSpeedBase = 0;
+  windSpeedTarget = 0;
+  windSpeedDriftAccum = 0;
 
   // Game objects
   boardGroup!: THREE.Group;
@@ -578,6 +582,8 @@ export class CornholeGame {
     this.temperatureF = Math.round(THREE.MathUtils.clamp(54 + warmthCurve * 30 + THREE.MathUtils.randFloatSpread(8), 48, 94));
     this.humidityPct = Math.round(THREE.MathUtils.clamp(74 - warmthCurve * 18 + THREE.MathUtils.randFloatSpread(16), 34, 92));
     this.windMph = Math.round(THREE.MathUtils.clamp(THREE.MathUtils.randFloat(0, 10), 0, 20));
+    this.windSpeedBase = this.windMph;
+    this.windSpeedTarget = this.windMph;
 
     const windAngle = THREE.MathUtils.randFloat(-Math.PI * 0.82, Math.PI * 0.82);
     this.windVector.set(Math.sin(windAngle), 0, -Math.cos(windAngle)).normalize();
@@ -1106,7 +1112,10 @@ export class CornholeGame {
       const file = `${prefix}-${i}.mp3`;
       try {
         const response = await fetch(`/audio/${file}`, { method: 'HEAD' });
-        if (response.ok) {
+        // Vite's SPA fallback returns 200 with text/html for missing files,
+        // so we must reject that case.
+        const contentType = response.headers.get('content-type') ?? '';
+        if (response.ok && !contentType.includes('text/html')) {
           files.push(file);
           misses = 0;
         } else {
@@ -3774,7 +3783,7 @@ export class CornholeGame {
     this.state.throwStyle = this.throwStyle;
     this.state.timeOfDayLabel = this.formatTimeOfDayLabel();
     this.state.temperatureF = this.temperatureF;
-    this.state.windMph = this.windMph;
+    this.state.windMph = Math.round(this.windMph);
     this.state.windDirection = this.windDirection;
     this.state.humidityPct = this.humidityPct;
     this.state.weatherEnabled = this.weatherEnabled;
@@ -3899,6 +3908,51 @@ export class CornholeGame {
     const timeScale = this.slowMotionEnabled ? 0.25 : 1.0;
     dt *= timeScale;
     this.totalTime += dt;
+
+    // Advance time-of-day at 4× real time (1 game minute per 15 real seconds).
+    // timeOfDay is in hours, so 4 game-seconds per real-second = 4/3600 hr/s.
+    // Clamped so it never goes past dusk.
+    this.timeOfDay = THREE.MathUtils.clamp(
+      this.timeOfDay + dt * (4 / 3600),
+      DAWN_TIME,
+      DUSK_TIME
+    );
+    this.applyTimeOfDayLighting();
+
+    // Wind variability: slowly drift the wind direction by ±2°/sec and
+    // fluctuate wind speed by ±1-2 mph to keep it feeling alive.
+    if (this.weatherEnabled) {
+      // Direction drift — rotate the existing vector by a small random angle.
+      const driftDegPerSec = THREE.MathUtils.randFloat(-2, 2);
+      const driftRad = THREE.MathUtils.degToRad(driftDegPerSec) * dt;
+      const cos = Math.cos(driftRad);
+      const sin = Math.sin(driftRad);
+      const newX = this.windVector.x * cos - this.windVector.z * sin;
+      const newZ = this.windVector.x * sin + this.windVector.z * cos;
+      this.windVector.set(newX, 0, newZ).normalize();
+      this.windDirection = this.getCompassDirection(this.windVector);
+
+      // Speed fluctuation — ease the displayed mph toward a slowly-moving
+      // target that jitters by ±2 around the base value set at game start.
+      // Use a fast lerp (dt*2) so the value visibly changes within a few
+      // seconds.  Don't round here — only round when emitting to the UI.
+      this.windSpeedDriftAccum = (this.windSpeedDriftAccum ?? 0) + dt;
+      if (this.windSpeedDriftAccum >= 3) {
+        this.windSpeedDriftAccum = 0;
+        this.windSpeedTarget = THREE.MathUtils.clamp(
+          this.windSpeedBase + THREE.MathUtils.randFloatSpread(4),
+          0, 20
+        );
+      }
+      this.windMph = THREE.MathUtils.lerp(this.windMph, this.windSpeedTarget, dt * 2);
+
+      // Push updated weather labels to the UI every second.
+      this.weatherEmitAccum = (this.weatherEmitAccum ?? 0) + dt;
+      if (this.weatherEmitAccum >= 1) {
+        this.weatherEmitAccum = 0;
+        this.emitState();
+      }
+    }
 
     // Move clouds and fade them near the wrap edges so the loop isn't visible.
     // Sun direction for projecting cloud shadows onto the ground.
