@@ -12,6 +12,7 @@ const HOLE_Z = -1.25; // hole position along board (local Z)
 const HOLE_CAPTURE_Y = -0.05;
 const HOLE_CAPTURE_RADIUS = HOLE_RADIUS * 0.84;
 const HOLE_FUNNEL_RADIUS = HOLE_RADIUS * 0.96;
+const HOLE_VISUAL_CLEANUP_DELAY = 0.75;
 const BOARD_TILT = 0.18;
 const FRONT_EDGE_TOP_HEIGHT = 0.26;
 const TOP_PANEL_THICKNESS = 0.06;
@@ -45,6 +46,21 @@ const BOARD_TEXTURE_FILES = [
   '/audio/imgs/board-texture-4.png',
   '/audio/imgs/board-texture-5.png',
 ] as const;
+const TREE_TRUNK_TEXTURE_FILE = '/audio/imgs/trunk-texture.png';
+const TREE_FOLIAGE_TEXTURE_FILE = '/audio/imgs/tree-foliage-texture.png';
+const BUSH_TEXTURE_FILE = '/audio/imgs/bush-texture.png';
+const GRASS_TEXTURE_FILE = '/audio/imgs/grass-texture.png';
+const DIRT_TEXTURE_FILE = '/audio/imgs/dirt-texture.png';
+const BAG_FACE_TEXTURE_FILES = {
+  red: {
+    sticky: '/audio/imgs/bag-red-sticky.png',
+    slick: '/audio/imgs/bag-red-slick.png',
+  },
+  blue: {
+    sticky: '/audio/imgs/bag-blue-sticky.png',
+    slick: '/audio/imgs/bag-blue-slick.png',
+  },
+} as const;
 
 // ====== PHYSICS MATERIAL CONSTANTS ======
 const FRICTION = {
@@ -178,6 +194,12 @@ export class CornholeGame {
   boardTopMaterial!: THREE.MeshStandardMaterial;
   boardTopTextures: THREE.Texture[] = [];
   boardTextureIndex = 0;
+  treeTrunkTexture: THREE.Texture | null = null;
+  treeFoliageTexture: THREE.Texture | null = null;
+  bushTexture: THREE.Texture | null = null;
+  grassTexture: THREE.Texture | null = null;
+  dirtTexture: THREE.Texture | null = null;
+  bagFaceTextures: Partial<Record<`${'red' | 'blue'}-${BagSide}`, THREE.Texture>> = {};
   bags: THREE.Mesh[] = [];
   bagBodies: CANNON.Body[] = [];
   bagSides: BagSide[] = Array(8).fill('sticky');
@@ -335,6 +357,10 @@ export class CornholeGame {
   boardHitSounds: AudioBuffer[] = [];
   bagOnBagSounds: AudioBuffer[] = [];
   cornholeSounds: AudioBuffer[] = [];
+  ambienceSounds: AudioBuffer[] = [];
+  ambienceSource: AudioBufferSourceNode | null = null;
+  ambienceGain: GainNode | null = null;
+  pendingAmbienceStart = false;
 
   // Hole detection - track previous positions for trajectory crossing
   bagPrevPositions: THREE.Vector3[] = Array(8).fill(null).map(() => new THREE.Vector3());
@@ -619,11 +645,11 @@ export class CornholeGame {
   createGround(material: CANNON.Material) {
     // Grass
     const grassGeo = new THREE.PlaneGeometry(80, 100);
-    const grassTex = this.createGrassTexture();
+    const grassTex = this.getGrassTexture();
     const grassMat = new THREE.MeshStandardMaterial({
       map: grassTex,
-      color: 0xccddc8,
-      roughness: 0.85,
+      color: 0xb7cfae,
+      roughness: 0.92,
       metalness: 0.05,
     });
     const grass = new THREE.Mesh(grassGeo, grassMat);
@@ -634,7 +660,7 @@ export class CornholeGame {
 
     // Pitch (dirt path)
     const pitchGeo = new THREE.PlaneGeometry(5, PITCH_LENGTH + 5);
-    const pitchTex = this.createDirtTexture();
+    const pitchTex = this.getDirtTexture();
     const pitchAlphaMap = this.createPitchAlphaMap();
     const pitchMat = new THREE.MeshStandardMaterial({
       map: pitchTex,
@@ -1004,6 +1030,8 @@ export class CornholeGame {
   async initAudio() {
     try {
       this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      window.addEventListener('pointerdown', this.unlockAudio, { once: true });
+      window.addEventListener('keydown', this.unlockAudio, { once: true });
 
       // Load board hit sounds
       const soundFiles = ['bag-on-board-1.mp3', 'bag-on-board-2.mp3', 'bag-on-board-3.mp3'];
@@ -1049,8 +1077,94 @@ export class CornholeGame {
           console.warn(`Failed to load audio file: ${file}`, e);
         }
       }
+
+      // Load ambience files dynamically from the numbered ambience-N.mp3 set.
+      const ambienceFiles = await this.discoverNumberedAudioFiles('ambience');
+      for (const file of ambienceFiles) {
+        try {
+          const response = await fetch(`/audio/${file}`);
+          const arrayBuffer = await response.arrayBuffer();
+          const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
+          this.ambienceSounds.push(audioBuffer);
+        } catch (e) {
+          console.warn(`Failed to load audio file: ${file}`, e);
+        }
+      }
+      this.startRandomAmbience();
     } catch (e) {
       console.warn('Web Audio API not supported');
+    }
+  }
+
+  async discoverNumberedAudioFiles(prefix: string) {
+    const files: string[] = [];
+    let misses = 0;
+    const maxConsecutiveMisses = 3;
+    const maxFilesToProbe = 64;
+
+    for (let i = 1; i <= maxFilesToProbe && misses < maxConsecutiveMisses; i++) {
+      const file = `${prefix}-${i}.mp3`;
+      try {
+        const response = await fetch(`/audio/${file}`, { method: 'HEAD' });
+        if (response.ok) {
+          files.push(file);
+          misses = 0;
+        } else {
+          misses += 1;
+        }
+      } catch {
+        misses += 1;
+      }
+    }
+
+    return files;
+  }
+
+  unlockAudio = async () => {
+    if (!this.audioContext) return;
+    if (this.audioContext.state === 'suspended') {
+      await this.audioContext.resume();
+    }
+    if (this.pendingAmbienceStart || !this.ambienceSource) {
+      this.startRandomAmbience();
+    }
+  };
+
+  startRandomAmbience() {
+    if (!this.audioContext || this.ambienceSounds.length === 0) {
+      this.pendingAmbienceStart = true;
+      return;
+    }
+
+    this.stopAmbience();
+
+    const randomSound = this.ambienceSounds[Math.floor(Math.random() * this.ambienceSounds.length)];
+    const source = this.audioContext.createBufferSource();
+    const gain = this.audioContext.createGain();
+    source.buffer = randomSound;
+    source.loop = true;
+    gain.gain.value = 0.24;
+    source.connect(gain);
+    gain.connect(this.audioContext.destination);
+    source.start(0);
+    this.ambienceSource = source;
+    this.ambienceGain = gain;
+    this.pendingAmbienceStart = this.audioContext.state === 'suspended';
+  }
+
+  stopAmbience() {
+    if (this.ambienceSource) {
+      try {
+        this.ambienceSource.stop();
+      } catch {
+        // Source may already be stopped during disposal/restart.
+      }
+      this.ambienceSource.disconnect();
+      this.ambienceSource = null;
+    }
+    if (this.ambienceGain) {
+      this.ambienceGain.disconnect();
+      this.ambienceGain = null;
     }
   }
 
@@ -1207,22 +1321,15 @@ export class CornholeGame {
   createBagMeshMaterials(teamColor: number): THREE.MeshStandardMaterial[] {
     const edgeTex = this.createFabricTexture(teamColor);
     const isBlueTeam = ((teamColor >> 16) & 0xff) < ((teamColor >> 8) & 0xff) + ((teamColor >> 0) & 0xff);
-    const stickyTex = this.createBagFaceTexture(
-      isBlueTeam ? this.shadeColor(teamColor, 0.18) : this.shadeColor(teamColor, 0.08),
-      isBlueTeam ? this.tintColor(teamColor, 0.35) : this.tintColor(teamColor, 0.16),
-      false
-    );
-    const slickTex = this.createBagFaceTexture(
-      this.shadeColor(teamColor, isBlueTeam ? 0.2 : 0.14),
-      this.tintColor(teamColor, isBlueTeam ? 0.42 : 0.28),
-      true
-    );
+    const team = isBlueTeam ? 'blue' : 'red';
+    const stickyTex = this.getBagFaceTexture(team, 'sticky');
+    const slickTex = this.getBagFaceTexture(team, 'slick');
 
     return [
       new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
       new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
-      new THREE.MeshStandardMaterial({ map: stickyTex, roughness: 0.96, metalness: 0.0 }),
-      new THREE.MeshStandardMaterial({ map: slickTex, roughness: 0.82, metalness: 0.0 }),
+      new THREE.MeshStandardMaterial({ map: stickyTex, color: 0xffffff, roughness: 0.98, metalness: 0.0 }),
+      new THREE.MeshStandardMaterial({ map: slickTex, color: 0xffffff, roughness: 0.42, metalness: 0.0 }),
       new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
       new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
     ];
@@ -1265,7 +1372,9 @@ export class CornholeGame {
     const materials = Array.isArray(material) ? material : [material];
     for (const mat of materials) {
       const standardMat = mat as THREE.MeshStandardMaterial;
-      if (standardMat.map) standardMat.map.dispose();
+      if (standardMat.map && !standardMat.map.userData.sharedBagFaceTexture) {
+        standardMat.map.dispose();
+      }
       standardMat.dispose();
     }
   }
@@ -1554,8 +1663,10 @@ export class CornholeGame {
   createBush(): THREE.Group {
     const group = new THREE.Group();
     const bushMat = new THREE.MeshStandardMaterial({
-      color: 0x2d6b28,
-      roughness: 0.9,
+      map: this.getBushTexture(),
+      color: 0x78b45f,
+      roughness: 0.92,
+      metalness: 0.0,
     });
     const puffCount = 3 + Math.floor(Math.random() * 3);
     for (let i = 0; i < puffCount; i++) {
@@ -1702,14 +1813,24 @@ export class CornholeGame {
 
   createTree(): THREE.Group {
     const group = new THREE.Group();
-    const trunkGeo = new THREE.CylinderGeometry(0.12, 0.2, 2.5, 6);
-    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5C3A1E, roughness: 0.9 });
+    const trunkGeo = new THREE.CylinderGeometry(0.12, 0.2, 2.5, 14);
+    const trunkMat = new THREE.MeshStandardMaterial({
+      map: this.getTreeTrunkTexture(),
+      color: 0xc79a72,
+      roughness: 0.95,
+      metalness: 0.0,
+    });
     const trunk = new THREE.Mesh(trunkGeo, trunkMat);
     trunk.position.y = 1.25;
     trunk.castShadow = true;
     group.add(trunk);
 
-    const foliageMat = new THREE.MeshStandardMaterial({ color: 0x2D7D2D, roughness: 0.8 });
+    const foliageMat = new THREE.MeshStandardMaterial({
+      map: this.getTreeFoliageTexture(),
+      color: 0x86b86a,
+      roughness: 0.88,
+      metalness: 0.0,
+    });
     const sizes = [1.8, 1.4, 1.0];
     const heights = [2.8, 3.6, 4.2];
     for (let i = 0; i < 3; i++) {
@@ -1757,82 +1878,6 @@ export class CornholeGame {
   }
 
   // ====== TEXTURES ======
-
-  createGrassTexture(): THREE.CanvasTexture {
-    const c = document.createElement('canvas');
-    c.width = 512;
-    c.height = 512;
-    const ctx = c.getContext('2d')!;
-    ctx.fillStyle = '#3a7d3a';
-    ctx.fillRect(0, 0, 512, 512);
-    for (let i = 0; i < 12000; i++) {
-      const x = Math.random() * 512;
-      const y = Math.random() * 512;
-      const s = Math.random() * 30 - 15;
-      ctx.fillStyle = `rgb(${58 + s},${125 + s},${58 + s})`;
-      ctx.fillRect(x, y, 1 + Math.random() * 2, 2 + Math.random() * 3);
-    }
-    const tex = new THREE.CanvasTexture(c);
-    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(12, 12);
-    return tex;
-  }
-
-  createDirtTexture(): THREE.CanvasTexture {
-    const c = document.createElement('canvas');
-    c.width = 256;
-    c.height = 256;
-    const ctx = c.getContext('2d')!;
-
-    // Parse RGB color
-    const rgbMatch = 'rgb(97, 49, 4)'.match(/\d+/g);
-    const baseR = parseInt(rgbMatch![0]);
-    const baseG = parseInt(rgbMatch![1]);
-    const baseB = parseInt(rgbMatch![2]);
-
-    // Base color fill
-    ctx.fillStyle = `rgb(${baseR}, ${baseG}, ${baseB})`;
-    ctx.fillRect(0, 0, 256, 256);
-
-    // Add organic dirt texture with varied particle sizes and colors
-    for (let i = 0; i < 8000; i++) {
-      const x = Math.random() * 256;
-      const y = Math.random() * 256;
-      const s = Math.random() * 30 - 15;
-      const size = 1 + Math.random() * 4;
-
-      const r = Math.max(0, Math.min(255, baseR + s + Math.random() * 1));
-      const g = Math.max(0, Math.min(255, baseG + s + Math.random() * 1));
-      const b = Math.max(0, Math.min(255, baseB + s + Math.random() * 1));
-
-      ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
-
-      if (Math.random() > 0.5) {
-        ctx.fillRect(x, y, size, size);
-      } else {
-        ctx.beginPath();
-        ctx.arc(x, y, size / 2, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
-
-    // Add some larger pebbles/rocks
-    for (let i = 0; i < 200; i++) {
-      const x = Math.random() * 256;
-      const y = Math.random() * 256;
-      const size = 2 + Math.random() * 6;
-      const gray = 80 + Math.random() * 40;
-      ctx.fillStyle = `rgb(${gray}, ${gray - 20}, ${gray - 30})`;
-      ctx.beginPath();
-      ctx.arc(x, y, size / 2, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    const tex = new THREE.CanvasTexture(c);
-    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(2, 12);
-    return tex;
-  }
 
   createPitchAlphaMap(): THREE.CanvasTexture {
     // Alpha map that fades the pitch edges with an irregular/organic border
@@ -1962,6 +2007,85 @@ export class CornholeGame {
     return tex;
   }
 
+  getTreeTrunkTexture(): THREE.Texture {
+    if (this.treeTrunkTexture) return this.treeTrunkTexture;
+
+    const tex = new THREE.TextureLoader().load(TREE_TRUNK_TEXTURE_FILE);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(1.8, 1);
+    tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+    this.treeTrunkTexture = tex;
+    return tex;
+  }
+
+  getTreeFoliageTexture(): THREE.Texture {
+    if (this.treeFoliageTexture) return this.treeFoliageTexture;
+
+    const tex = new THREE.TextureLoader().load(TREE_FOLIAGE_TEXTURE_FILE);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(2.5, 2.5);
+    tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+    this.treeFoliageTexture = tex;
+    return tex;
+  }
+
+  getBushTexture(): THREE.Texture {
+    if (this.bushTexture) return this.bushTexture;
+
+    const tex = new THREE.TextureLoader().load(BUSH_TEXTURE_FILE);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(1.6, 1.6);
+    tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+    this.bushTexture = tex;
+    return tex;
+  }
+
+  getGrassTexture(): THREE.Texture {
+    if (this.grassTexture) return this.grassTexture;
+
+    const tex = new THREE.TextureLoader().load(GRASS_TEXTURE_FILE);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(18, 22);
+    tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+    this.grassTexture = tex;
+    return tex;
+  }
+
+  getDirtTexture(): THREE.Texture {
+    if (this.dirtTexture) return this.dirtTexture;
+
+    const tex = new THREE.TextureLoader().load(DIRT_TEXTURE_FILE);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(2, 12);
+    tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+    this.dirtTexture = tex;
+    return tex;
+  }
+
+  getBagFaceTexture(team: 'red' | 'blue', side: BagSide): THREE.Texture {
+    const key = `${team}-${side}` as const;
+    if (this.bagFaceTextures[key]) return this.bagFaceTextures[key];
+
+    const tex = new THREE.TextureLoader().load(BAG_FACE_TEXTURE_FILES[team][side]);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = THREE.ClampToEdgeWrapping;
+    tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
+    tex.userData.sharedBagFaceTexture = true;
+    this.bagFaceTextures[key] = tex;
+    return tex;
+  }
+
   cycleBoardTexture() {
     this.boardTextureIndex = (this.boardTextureIndex + 1) % BOARD_TEXTURE_FILES.length;
     if (this.boardTopMaterial) {
@@ -2015,67 +2139,6 @@ export class CornholeGame {
 
     const tex = new THREE.CanvasTexture(c);
     return tex;
-  }
-
-  tintColor(color: number, amount: number): number {
-    const r = (color >> 16) & 0xff;
-    const g = (color >> 8) & 0xff;
-    const b = color & 0xff;
-    const mix = (channel: number) => Math.max(0, Math.min(255, Math.round(channel + (255 - channel) * amount)));
-    return (mix(r) << 16) | (mix(g) << 8) | mix(b);
-  }
-
-  shadeColor(color: number, amount: number): number {
-    const r = (color >> 16) & 0xff;
-    const g = (color >> 8) & 0xff;
-    const b = color & 0xff;
-    const mix = (channel: number) => Math.max(0, Math.min(255, Math.round(channel * (1 - amount))));
-    return (mix(r) << 16) | (mix(g) << 8) | mix(b);
-  }
-
-  createBagFaceTexture(baseColor: number, accentColor: number, glossy: boolean): THREE.CanvasTexture {
-    const c = document.createElement('canvas');
-    c.width = 128;
-    c.height = 128;
-    const ctx = c.getContext('2d')!;
-    const base = `#${baseColor.toString(16).padStart(6, '0')}`;
-    const accent = `#${accentColor.toString(16).padStart(6, '0')}`;
-
-    ctx.fillStyle = base;
-    ctx.fillRect(0, 0, 128, 128);
-
-    if (glossy) {
-      for (let i = -32; i < 160; i += 18) {
-        ctx.strokeStyle = accent;
-        ctx.lineWidth = 6;
-        ctx.beginPath();
-        ctx.moveTo(i, 0);
-        ctx.lineTo(i + 40, 128);
-        ctx.stroke();
-      }
-      ctx.fillStyle = 'rgba(255,255,255,0.14)';
-      ctx.fillRect(10, 10, 108, 24);
-    } else {
-      ctx.strokeStyle = accent;
-      ctx.lineWidth = 2;
-      for (let i = 12; i < 128; i += 12) {
-        ctx.beginPath();
-        ctx.moveTo(i, 12);
-        ctx.lineTo(i, 116);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(12, i);
-        ctx.lineTo(116, i);
-        ctx.stroke();
-      }
-    }
-
-    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
-    ctx.lineWidth = 3;
-    ctx.setLineDash([6, 4]);
-    ctx.strokeRect(10, 10, 108, 108);
-
-    return new THREE.CanvasTexture(c);
   }
 
   // ====== GAME LOGIC ======
@@ -2266,10 +2329,10 @@ export class CornholeGame {
     const sideFlip = this.selectedBagSide === 'sticky' ? Math.PI : 0;
     const isRollThrow = this.throwStyle === 'roll';
     const releasePitch = isRollThrow
-      ? THREE.MathUtils.lerp(0.48, 0.66, speedT)
+      ? THREE.MathUtils.lerp(0.38, 0.52, speedT)
       : THREE.MathUtils.lerp(0.32, 0.12, speedT);
     const releaseYaw = isRollThrow ? this.aimX * 0.015 : 0;
-    const releaseRoll = isRollThrow ? -this.aimX * 0.015 : -this.aimX * 0.08;
+    const releaseRoll = isRollThrow ? 0.82 - this.aimX * 0.04 : -this.aimX * 0.08;
     body.quaternion.setFromEuler(sideFlip + releasePitch, releaseYaw, releaseRoll);
     body.material = this.selectedBagSide === 'sticky' ? this.stickyBagMaterial : this.slickBagMaterial;
     body.linearDamping = 0.4;
@@ -2292,7 +2355,7 @@ export class CornholeGame {
       ? THREE.MathUtils.lerp(1.02, 0.68, speedT)
       : THREE.MathUtils.lerp(1.06, 0.72, speedT));
     const arcVy = isRollThrow
-      ? THREE.MathUtils.lerp(5.9, 9.1, this.pullDistance)
+      ? THREE.MathUtils.lerp(4.7, 7.25, this.pullDistance)
       : THREE.MathUtils.lerp(5.6, 9.4, this.pullDistance);
     const vy = isRollThrow
       ? THREE.MathUtils.lerp(arcVy * 0.9, arcVy * 0.42, speedT)
@@ -2720,8 +2783,8 @@ export class CornholeGame {
     const activeIndex = this.activeThrownBagIndex;
     if (activeIndex === null) return;
     if (!this.state.isThrowing && !this.state.isSettling) return;
-    if (this.impactSoundPlayed[activeIndex]) return;
     if (!this.bags[activeIndex]?.visible) return;
+    if (this.impactSoundPlayed[activeIndex]) return;
 
     const activeBody = this.bagBodies[activeIndex];
     if (!activeBody) return;
@@ -3166,22 +3229,29 @@ export class CornholeGame {
   }
 
   finalizeBagInHole(index: number) {
-    // Clear bags from hole after they've been counted for 5 seconds to prevent clogging
+    // Captured hole bags have collision disabled so the rigid box body can pass
+    // through the visual opening. Hide/remove them quickly once they are below
+    // the board so they don't visibly fall through the ground.
     if (!this.bagInHole[index]) return;
     if (this.bagPendingHoleCleanup[index]) return;
 
+    const body = this.bagBodies[index];
+    const boardLocal = new THREE.Vector3(body.position.x, body.position.y, body.position.z);
+    this.boardGroup.worldToLocal(boardLocal);
     const timeSinceDetection = this.totalTime - this.bagInHoleDetectedAt[index];
-    if (timeSinceDetection > 5.0) {
+    const belowBoard = boardLocal.y < HOLE_CAPTURE_Y - BAG_SIZE * 1.35;
+
+    if (timeSinceDetection > HOLE_VISUAL_CLEANUP_DELAY || belowBoard) {
       // Mark for cleanup and remove from physics world
       this.bagPendingHoleCleanup[index] = true;
       this.bagHoleCleanupReadyAt[index] = this.totalTime;
 
-      const body = this.bagBodies[index];
       const mesh = this.bags[index];
 
       // Remove from physics world
       if (body) {
         this.world.removeBody(body);
+        body.collisionResponse = true;
       }
 
       // Hide the mesh
@@ -4063,6 +4133,8 @@ export class CornholeGame {
     window.removeEventListener('resize', this.handleResize);
     window.removeEventListener('keydown', this.handleKeyDown);
     window.removeEventListener('keyup', this.handleKeyUp);
+    window.removeEventListener('pointerdown', this.unlockAudio);
+    window.removeEventListener('keydown', this.unlockAudio);
     const canvas = this.renderer.domElement;
     if (document.pointerLockElement === canvas) {
       document.exitPointerLock?.();
@@ -4081,6 +4153,15 @@ export class CornholeGame {
     for (const texture of this.boardTopTextures) {
       texture?.dispose();
     }
+    this.treeTrunkTexture?.dispose();
+    this.treeFoliageTexture?.dispose();
+    this.bushTexture?.dispose();
+    this.grassTexture?.dispose();
+    this.dirtTexture?.dispose();
+    for (const texture of Object.values(this.bagFaceTextures)) {
+      texture?.dispose();
+    }
+    this.stopAmbience();
     this.renderer.dispose();
   }
 
@@ -4153,6 +4234,7 @@ export class CornholeGame {
     for (let i = 0; i < 8; i++) {
       this.bagPrevPositions[i].set(0, 0, 0);
     }
+    this.startRandomAmbience();
     this.startTurn(1);
     this.emitState();
   }
