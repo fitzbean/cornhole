@@ -3,6 +3,14 @@ import type { BagSide, ThrowStyle } from '../CornholeGame';
 export type PlayerSlot = 1 | 2;
 export type Role = 'host' | 'guest';
 
+export interface ChatMessage {
+  id: string;
+  from: Role;
+  playerSlot: PlayerSlot;
+  text: string;
+  ts: number;
+}
+
 export type Intent =
   | { type: 'startGame' }
   | { type: 'moveStart'; direction: 'left' | 'right' | 'up' | 'down' }
@@ -47,6 +55,7 @@ export type Envelope =
   | { kind: 'heartbeat'; from: Role; ts: number; clientId: string }
   | { kind: 'intent'; from: Role; intent: Intent; ts: number; clientId: string }
   | { kind: 'snapshot'; from: 'host'; snapshot: Snapshot; clientId: string }
+  | { kind: 'chat'; from: Role; message: ChatMessage; clientId: string }
   | { kind: 'bye'; from: Role; clientId: string }
   | { kind: 'roomFull'; from: 'host'; toClientId: string };
 

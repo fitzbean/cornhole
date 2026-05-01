@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { createTransport } from './transport';
-import type { ConnectionStatus, Envelope, PlayerSlot, Role, Snapshot, Transport } from './types';
+import type { ChatMessage, ConnectionStatus, Envelope, PlayerSlot, Role, Snapshot, Transport } from './types';
 import type { CornholeGame } from '../CornholeGame';
 import type { Intent } from './types';
 
@@ -15,6 +15,8 @@ export interface RoomHandle {
   status: ConnectionStatus;
   peerConnected: boolean;
   rejected: boolean;
+  messages: ChatMessage[];
+  sendChat(text: string): void;
 }
 
 const HEARTBEAT_INTERVAL_MS = 1000;
@@ -28,7 +30,15 @@ export function useRoom({ roomId, role, localPlayerSlot, game }: RoomOptions): R
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [peerConnected, setPeerConnected] = useState(false);
   const [rejected, setRejected] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const transportRef = useRef<Transport | null>(null);
+  const clientIdRef = useRef<string>(newClientId());
+
+  useEffect(() => {
+    setMessages([]);
+    setRejected(false);
+    setPeerConnected(false);
+  }, [roomId, role, game]);
 
   useEffect(() => {
     if (!game) return;
@@ -36,6 +46,7 @@ export function useRoom({ roomId, role, localPlayerSlot, game }: RoomOptions): R
     const transport = createTransport(roomId, role);
     transportRef.current = transport;
     const clientId = newClientId();
+    clientIdRef.current = clientId;
     // Host tracks which guest clientId currently owns the opponent slot so we
     // can reject a third browser that tries to join the same room.
     let acceptedPeerClientId: string | null = null;
@@ -116,6 +127,8 @@ export function useRoom({ roomId, role, localPlayerSlot, game }: RoomOptions): R
         game.applyIntent(envelope.intent, senderSlot);
       } else if (envelope.kind === 'snapshot' && role === 'guest') {
         game.applySnapshot(envelope.snapshot);
+      } else if (envelope.kind === 'chat') {
+        setMessages((prev) => [...prev, envelope.message].slice(-80));
       } else if (envelope.kind === 'bye') {
         setPeerConnected(false);
         lastPeerMessageAt = 0;
@@ -166,5 +179,19 @@ export function useRoom({ roomId, role, localPlayerSlot, game }: RoomOptions): R
     };
   }, [roomId, role, localPlayerSlot, game]);
 
-  return { status, peerConnected, rejected };
+  const sendChat = (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed || !transportRef.current) return;
+    const message: ChatMessage = {
+      id: `${clientIdRef.current}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+      from: role,
+      playerSlot: localPlayerSlot,
+      text: trimmed.slice(0, 180),
+      ts: Date.now(),
+    };
+    setMessages((prev) => [...prev, message].slice(-80));
+    transportRef.current.send({ kind: 'chat', from: role, message, clientId: clientIdRef.current });
+  };
+
+  return { status, peerConnected, rejected, messages, sendChat };
 }

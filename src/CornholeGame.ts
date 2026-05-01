@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 // ====== CONSTANTS ======
 const BOARD_W = 2.0;
@@ -48,6 +49,8 @@ const BOARD_TEXTURE_FILES = [
 ] as const;
 const TREE_TRUNK_TEXTURE_FILE = '/audio/imgs/trunk-texture.png';
 const TREE_FOLIAGE_TEXTURE_FILE = '/audio/imgs/tree-foliage-texture.png';
+const TREE_MODEL_FILE = '/audio/3d/tree.glb';
+const BUSH_MODEL_FILE = '/audio/3d/bush.glb';
 const BUSH_TEXTURE_FILE = '/audio/imgs/bush-texture.png';
 const GRASS_TEXTURE_FILE = '/audio/imgs/grass-texture.png';
 const DIRT_TEXTURE_FILE = '/audio/imgs/dirt-texture.png';
@@ -61,6 +64,18 @@ const BAG_FACE_TEXTURE_FILES = {
     slick: '/audio/imgs/bag-blue-slick.png',
   },
 } as const;
+const PRELOAD_TEXTURE_FILES = [
+  ...BOARD_TEXTURE_FILES,
+  TREE_TRUNK_TEXTURE_FILE,
+  TREE_FOLIAGE_TEXTURE_FILE,
+  BUSH_TEXTURE_FILE,
+  GRASS_TEXTURE_FILE,
+  DIRT_TEXTURE_FILE,
+  BAG_FACE_TEXTURE_FILES.red.sticky,
+  BAG_FACE_TEXTURE_FILES.red.slick,
+  BAG_FACE_TEXTURE_FILES.blue.sticky,
+  BAG_FACE_TEXTURE_FILES.blue.slick,
+] as const;
 
 // ====== PHYSICS MATERIAL CONSTANTS ======
 const FRICTION = {
@@ -161,6 +176,11 @@ export interface GameState {
 }
 
 export class CornholeGame {
+  static preloadPromise: Promise<void> | null = null;
+  static preloadedTextures = new Map<string, THREE.Texture>();
+  static preloadedTreeModelTemplate: THREE.Group | null = null;
+  static preloadedBushModelTemplate: THREE.Group | null = null;
+
   scene: THREE.Scene;
   camera: THREE.PerspectiveCamera;
   boardCamera: THREE.OrthographicCamera;
@@ -204,6 +224,13 @@ export class CornholeGame {
   grassTexture: THREE.Texture | null = null;
   dirtTexture: THREE.Texture | null = null;
   bagFaceTextures: Partial<Record<`${'red' | 'blue'}-${BagSide}`, THREE.Texture>> = {};
+  treeModelLoader = new GLTFLoader();
+  treeModelTemplate: THREE.Group | null = CornholeGame.preloadedTreeModelTemplate;
+  treeModelLoadStarted = CornholeGame.preloadedTreeModelTemplate !== null;
+  treeGroups: THREE.Group[] = [];
+  bushModelTemplate: THREE.Group | null = CornholeGame.preloadedBushModelTemplate;
+  bushModelLoadStarted = CornholeGame.preloadedBushModelTemplate !== null;
+  bushGroups: THREE.Group[] = [];
   bags: THREE.Mesh[] = [];
   bagBodies: CANNON.Body[] = [];
   bagSides: BagSide[] = Array(8).fill('sticky');
@@ -479,6 +506,90 @@ export class CornholeGame {
     this.installTestingHooks();
 
     this.animate();
+  }
+
+  static preloadAssets(): Promise<void> {
+    if (this.preloadPromise) return this.preloadPromise;
+
+    const textureLoader = new THREE.TextureLoader();
+    const gltfLoader = new GLTFLoader();
+    this.preloadPromise = Promise.allSettled([
+      ...PRELOAD_TEXTURE_FILES.map(async (file) => {
+        const tex = await textureLoader.loadAsync(file);
+        this.configureTextureForFile(file, tex);
+        this.preloadedTextures.set(file, tex);
+      }),
+      gltfLoader.loadAsync(TREE_MODEL_FILE).then((gltf) => {
+        this.preloadedTreeModelTemplate = this.prepareModelTemplate(gltf.scene, 5.2);
+      }),
+      gltfLoader.loadAsync(BUSH_MODEL_FILE).then((gltf) => {
+        this.preloadedBushModelTemplate = this.prepareModelTemplate(gltf.scene, 1.05);
+      }),
+    ]).then((results) => {
+      const failures = results.filter((result) => result.status === 'rejected');
+      if (failures.length > 0) {
+        console.warn('Some game assets failed to preload; falling back to on-demand loading.', failures);
+      }
+    });
+    return this.preloadPromise;
+  }
+
+  static configureTextureForFile(file: string, tex: THREE.Texture) {
+    tex.colorSpace = THREE.SRGBColorSpace;
+    if (BOARD_TEXTURE_FILES.includes(file as typeof BOARD_TEXTURE_FILES[number])) {
+      tex.wrapS = THREE.ClampToEdgeWrapping;
+      tex.wrapT = THREE.ClampToEdgeWrapping;
+      return;
+    }
+    if (file.includes('/bag-')) {
+      tex.wrapS = THREE.ClampToEdgeWrapping;
+      tex.wrapT = THREE.ClampToEdgeWrapping;
+      tex.userData.sharedBagFaceTexture = true;
+      return;
+    }
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    if (file === TREE_TRUNK_TEXTURE_FILE) tex.repeat.set(1.8, 1);
+    else if (file === TREE_FOLIAGE_TEXTURE_FILE) tex.repeat.set(2.5, 2.5);
+    else if (file === BUSH_TEXTURE_FILE) tex.repeat.set(1.6, 1.6);
+    else if (file === GRASS_TEXTURE_FILE) tex.repeat.set(18, 22);
+    else if (file === DIRT_TEXTURE_FILE) tex.repeat.set(2, 12);
+  }
+
+  static isPreloadedTexture(texture: THREE.Texture): boolean {
+    for (const preloaded of this.preloadedTextures.values()) {
+      if (preloaded === texture) return true;
+    }
+    return false;
+  }
+
+  static prepareModelTemplate(source: THREE.Group, targetHeight: number): THREE.Group {
+    const wrapper = new THREE.Group();
+    const model = source.clone(true);
+    model.traverse((child) => {
+      if (child instanceof THREE.Mesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+        const materials = Array.isArray(child.material) ? child.material : [child.material];
+        for (const material of materials) {
+          if (material instanceof THREE.MeshStandardMaterial) {
+            material.metalness = 0;
+            material.roughness = 0.78;
+            material.color.multiplyScalar(1.22);
+            material.needsUpdate = true;
+          }
+        }
+      }
+    });
+
+    const box = new THREE.Box3().setFromObject(model);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const modelScale = size.y > 0 ? targetHeight / size.y : 1;
+    model.scale.setScalar(modelScale);
+    model.position.set(-center.x * modelScale, -box.min.y * modelScale, -center.z * modelScale);
+    wrapper.add(model);
+    return wrapper;
   }
 
   // ====== SCENE CREATION ======
@@ -1338,7 +1449,7 @@ export class CornholeGame {
       new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
       new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
       new THREE.MeshStandardMaterial({ map: stickyTex, color: 0xffffff, roughness: 0.98, metalness: 0.0 }),
-      new THREE.MeshStandardMaterial({ map: slickTex, color: 0xffffff, roughness: 0.42, metalness: 0.0 }),
+      new THREE.MeshStandardMaterial({ map: slickTex, color: 0xffffff, roughness: 0.86, metalness: 0.0 }),
       new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
       new THREE.MeshStandardMaterial({ map: edgeTex, roughness: 0.88, metalness: 0.0 }),
     ];
@@ -1671,6 +1782,14 @@ export class CornholeGame {
 
   createBush(): THREE.Group {
     const group = new THREE.Group();
+    group.userData.isBushGroup = true;
+    this.bushGroups.push(group);
+    if (this.bushModelTemplate) {
+      this.applyBushModelToGroup(group);
+      return group;
+    }
+
+    this.loadBushModel();
     const bushMat = new THREE.MeshStandardMaterial({
       map: this.getBushTexture(),
       color: 0x78b45f,
@@ -1822,6 +1941,14 @@ export class CornholeGame {
 
   createTree(): THREE.Group {
     const group = new THREE.Group();
+    group.userData.isTreeGroup = true;
+    this.treeGroups.push(group);
+    if (this.treeModelTemplate) {
+      this.applyTreeModelToGroup(group);
+      return group;
+    }
+
+    this.loadTreeModel();
     const trunkGeo = new THREE.CylinderGeometry(0.12, 0.2, 2.5, 14);
     const trunkMat = new THREE.MeshStandardMaterial({
       map: this.getTreeTrunkTexture(),
@@ -1850,6 +1977,73 @@ export class CornholeGame {
       group.add(foliage);
     }
     return group;
+  }
+
+  loadBushModel() {
+    if (this.bushModelLoadStarted) return;
+    this.bushModelLoadStarted = true;
+    this.treeModelLoader.load(
+      BUSH_MODEL_FILE,
+      (gltf) => {
+        if (this.isDisposed) return;
+        this.bushModelTemplate = CornholeGame.prepareModelTemplate(gltf.scene, 1.05);
+        CornholeGame.preloadedBushModelTemplate = this.bushModelTemplate;
+        for (const group of this.bushGroups) {
+          this.applyBushModelToGroup(group);
+        }
+      },
+      undefined,
+      (error) => {
+        console.warn('Failed to load bush model; using procedural fallback bushes.', error);
+      }
+    );
+  }
+
+  applyBushModelToGroup(group: THREE.Group) {
+    if (!this.bushModelTemplate) return;
+    this.disposeGeneratedPlantMeshes(group);
+    group.clear();
+    const model = this.bushModelTemplate.clone(true);
+    group.add(model);
+  }
+
+  loadTreeModel() {
+    if (this.treeModelLoadStarted) return;
+    this.treeModelLoadStarted = true;
+    this.treeModelLoader.load(
+      TREE_MODEL_FILE,
+      (gltf) => {
+        if (this.isDisposed) return;
+        this.treeModelTemplate = CornholeGame.prepareModelTemplate(gltf.scene, 5.2);
+        CornholeGame.preloadedTreeModelTemplate = this.treeModelTemplate;
+        for (const group of this.treeGroups) {
+          this.applyTreeModelToGroup(group);
+        }
+      },
+      undefined,
+      (error) => {
+        console.warn('Failed to load tree model; using procedural fallback trees.', error);
+      }
+    );
+  }
+
+  applyTreeModelToGroup(group: THREE.Group) {
+    if (!this.treeModelTemplate) return;
+    this.disposeGeneratedPlantMeshes(group);
+    group.clear();
+    const model = this.treeModelTemplate.clone(true);
+    group.add(model);
+  }
+
+  disposeGeneratedPlantMeshes(group: THREE.Group) {
+    group.traverse((child) => {
+      if (!(child instanceof THREE.Mesh)) return;
+      child.geometry.dispose();
+      const materials = Array.isArray(child.material) ? child.material : [child.material];
+      for (const material of materials) {
+        material.dispose();
+      }
+    });
   }
 
   createFence() {
@@ -2007,10 +2201,8 @@ export class CornholeGame {
     if (this.boardTopTextures[index]) return this.boardTopTextures[index];
 
     const file = BOARD_TEXTURE_FILES[index] ?? BOARD_TEXTURE_FILES[0];
-    const tex = new THREE.TextureLoader().load(file);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.wrapS = THREE.ClampToEdgeWrapping;
-    tex.wrapT = THREE.ClampToEdgeWrapping;
+    const tex = CornholeGame.preloadedTextures.get(file) ?? new THREE.TextureLoader().load(file);
+    CornholeGame.configureTextureForFile(file, tex);
     tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
     this.boardTopTextures[index] = tex;
     return tex;
@@ -2019,11 +2211,8 @@ export class CornholeGame {
   getTreeTrunkTexture(): THREE.Texture {
     if (this.treeTrunkTexture) return this.treeTrunkTexture;
 
-    const tex = new THREE.TextureLoader().load(TREE_TRUNK_TEXTURE_FILE);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.wrapS = THREE.RepeatWrapping;
-    tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(1.8, 1);
+    const tex = CornholeGame.preloadedTextures.get(TREE_TRUNK_TEXTURE_FILE) ?? new THREE.TextureLoader().load(TREE_TRUNK_TEXTURE_FILE);
+    CornholeGame.configureTextureForFile(TREE_TRUNK_TEXTURE_FILE, tex);
     tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
     this.treeTrunkTexture = tex;
     return tex;
@@ -2032,11 +2221,8 @@ export class CornholeGame {
   getTreeFoliageTexture(): THREE.Texture {
     if (this.treeFoliageTexture) return this.treeFoliageTexture;
 
-    const tex = new THREE.TextureLoader().load(TREE_FOLIAGE_TEXTURE_FILE);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.wrapS = THREE.RepeatWrapping;
-    tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(2.5, 2.5);
+    const tex = CornholeGame.preloadedTextures.get(TREE_FOLIAGE_TEXTURE_FILE) ?? new THREE.TextureLoader().load(TREE_FOLIAGE_TEXTURE_FILE);
+    CornholeGame.configureTextureForFile(TREE_FOLIAGE_TEXTURE_FILE, tex);
     tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
     this.treeFoliageTexture = tex;
     return tex;
@@ -2045,11 +2231,8 @@ export class CornholeGame {
   getBushTexture(): THREE.Texture {
     if (this.bushTexture) return this.bushTexture;
 
-    const tex = new THREE.TextureLoader().load(BUSH_TEXTURE_FILE);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.wrapS = THREE.RepeatWrapping;
-    tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(1.6, 1.6);
+    const tex = CornholeGame.preloadedTextures.get(BUSH_TEXTURE_FILE) ?? new THREE.TextureLoader().load(BUSH_TEXTURE_FILE);
+    CornholeGame.configureTextureForFile(BUSH_TEXTURE_FILE, tex);
     tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
     this.bushTexture = tex;
     return tex;
@@ -2058,11 +2241,8 @@ export class CornholeGame {
   getGrassTexture(): THREE.Texture {
     if (this.grassTexture) return this.grassTexture;
 
-    const tex = new THREE.TextureLoader().load(GRASS_TEXTURE_FILE);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.wrapS = THREE.RepeatWrapping;
-    tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(18, 22);
+    const tex = CornholeGame.preloadedTextures.get(GRASS_TEXTURE_FILE) ?? new THREE.TextureLoader().load(GRASS_TEXTURE_FILE);
+    CornholeGame.configureTextureForFile(GRASS_TEXTURE_FILE, tex);
     tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
     this.grassTexture = tex;
     return tex;
@@ -2071,11 +2251,8 @@ export class CornholeGame {
   getDirtTexture(): THREE.Texture {
     if (this.dirtTexture) return this.dirtTexture;
 
-    const tex = new THREE.TextureLoader().load(DIRT_TEXTURE_FILE);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.wrapS = THREE.RepeatWrapping;
-    tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(2, 12);
+    const tex = CornholeGame.preloadedTextures.get(DIRT_TEXTURE_FILE) ?? new THREE.TextureLoader().load(DIRT_TEXTURE_FILE);
+    CornholeGame.configureTextureForFile(DIRT_TEXTURE_FILE, tex);
     tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
     this.dirtTexture = tex;
     return tex;
@@ -2085,10 +2262,9 @@ export class CornholeGame {
     const key = `${team}-${side}` as const;
     if (this.bagFaceTextures[key]) return this.bagFaceTextures[key];
 
-    const tex = new THREE.TextureLoader().load(BAG_FACE_TEXTURE_FILES[team][side]);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.wrapS = THREE.ClampToEdgeWrapping;
-    tex.wrapT = THREE.ClampToEdgeWrapping;
+    const file = BAG_FACE_TEXTURE_FILES[team][side];
+    const tex = CornholeGame.preloadedTextures.get(file) ?? new THREE.TextureLoader().load(file);
+    CornholeGame.configureTextureForFile(file, tex);
     tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
     tex.userData.sharedBagFaceTexture = true;
     this.bagFaceTextures[key] = tex;
@@ -4205,15 +4381,15 @@ export class CornholeGame {
       this.disposeBagMaterials(this.previewBag.material as THREE.Material | THREE.Material[]);
     }
     for (const texture of this.boardTopTextures) {
-      texture?.dispose();
+      if (texture && !CornholeGame.isPreloadedTexture(texture)) texture.dispose();
     }
-    this.treeTrunkTexture?.dispose();
-    this.treeFoliageTexture?.dispose();
-    this.bushTexture?.dispose();
-    this.grassTexture?.dispose();
-    this.dirtTexture?.dispose();
+    if (this.treeTrunkTexture && !CornholeGame.isPreloadedTexture(this.treeTrunkTexture)) this.treeTrunkTexture.dispose();
+    if (this.treeFoliageTexture && !CornholeGame.isPreloadedTexture(this.treeFoliageTexture)) this.treeFoliageTexture.dispose();
+    if (this.bushTexture && !CornholeGame.isPreloadedTexture(this.bushTexture)) this.bushTexture.dispose();
+    if (this.grassTexture && !CornholeGame.isPreloadedTexture(this.grassTexture)) this.grassTexture.dispose();
+    if (this.dirtTexture && !CornholeGame.isPreloadedTexture(this.dirtTexture)) this.dirtTexture.dispose();
     for (const texture of Object.values(this.bagFaceTextures)) {
-      texture?.dispose();
+      if (texture && !CornholeGame.isPreloadedTexture(texture)) texture.dispose();
     }
     this.stopAmbience();
     this.renderer.dispose();

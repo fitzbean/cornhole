@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import type { FormEvent } from 'react';
 import { BagSide, CornholeGame, GameState } from './CornholeGame';
 import { useRoom } from './net/useRoom';
 import {
@@ -11,7 +12,7 @@ import {
   rememberRoleForRoom,
 } from './net/roomCode';
 import { transportMode } from './net/transport';
-import type { Role } from './net/types';
+import type { ChatMessage, Role } from './net/types';
 
 const initialGameState: GameState = {
   bagsRemaining: 4,
@@ -60,14 +61,16 @@ function App() {
   const gameRef = useRef<CornholeGame | null>(null);
   const scoreHighlightTimeoutRef = useRef<number | null>(null);
   const previousScoresRef = useRef({ player1: 0, player2: 0 });
+  const chatScrollRef = useRef<HTMLDivElement>(null);
   const [gameState, setGameState] = useState<GameState>(initialGameState);
   const [power, setPower] = useState(65);
   const [scoreHighlightPlayer, setScoreHighlightPlayer] = useState<0 | 1 | 2>(0);
-  const [cinematicCameraEnabled, setCinematicCameraEnabled] = useState(false);
-  const [holeColliderDebugVisible, setHoleColliderDebugVisible] = useState(false);
+  const [cinematicCameraEnabled, setCinematicCameraEnabled] = useState(() => localStorage.getItem('cinematicCameraEnabled') === 'true');
+  const [holeColliderDebugVisible, setHoleColliderDebugVisible] = useState(() => localStorage.getItem('holeColliderDebugVisible') === 'true');
   const [hasStartedGame, setHasStartedGame] = useState(false);
   const [gameSession, setGameSession] = useState(0);
   const [gameInstance, setGameInstance] = useState<CornholeGame | null>(null);
+  const [assetStatus, setAssetStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [matchResult, setMatchResult] = useState<
     { player1Score: number; player2Score: number; winner: 1 | 2 } | null
   >(null);
@@ -84,6 +87,7 @@ function App() {
   }, []);
   const [online, setOnline] = useState<{ roomId: string; role: Role } | null>(initialOnline);
   const [copyFeedback, setCopyFeedback] = useState(false);
+  const [chatInput, setChatInput] = useState('');
   const localPlayerSlot: 1 | 2 = online?.role === 'guest' ? 2 : 1;
   const netMode = transportMode();
 
@@ -116,6 +120,21 @@ function App() {
   );
 
   useEffect(() => {
+    let cancelled = false;
+    CornholeGame.preloadAssets()
+      .then(() => {
+        if (!cancelled) setAssetStatus('ready');
+      })
+      .catch((error) => {
+        console.warn('Game asset preload failed; continuing with on-demand loading.', error);
+        if (!cancelled) setAssetStatus('error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!hasStartedGame || !canvasRef.current) return;
 
     const canvas = canvasRef.current;
@@ -137,10 +156,12 @@ function App() {
 
   useEffect(() => {
     gameRef.current?.setCinematicCameraEnabled(cinematicCameraEnabled);
+    localStorage.setItem('cinematicCameraEnabled', String(cinematicCameraEnabled));
   }, [cinematicCameraEnabled]);
 
   useEffect(() => {
     gameRef.current?.setHoleColliderDebugVisible(holeColliderDebugVisible);
+    localStorage.setItem('holeColliderDebugVisible', String(holeColliderDebugVisible));
   }, [holeColliderDebugVisible]);
 
   useEffect(() => {
@@ -172,7 +193,14 @@ function App() {
     setGameState(initialGameState);
   }, [gameState.gameOver, gameState.player1Score, gameState.player2Score, online, hasStartedGame, matchResult]);
 
-  const handleStartGame = useCallback(() => {
+  const ensureAssetsReady = useCallback(async () => {
+    if (assetStatus === 'ready' || assetStatus === 'error') return;
+    await CornholeGame.preloadAssets();
+    setAssetStatus('ready');
+  }, [assetStatus]);
+
+  const handleStartGame = useCallback(async () => {
+    await ensureAssetsReady();
     setPower(65);
     setScoreHighlightPlayer(0);
     previousScoresRef.current = { player1: 0, player2: 0 };
@@ -180,20 +208,28 @@ function App() {
     setScoreLog([]);
     setGameSession((session) => session + 1);
     setHasStartedGame(true);
-  }, []);
+  }, [ensureAssetsReady]);
 
-  const handleHostOnline = useCallback(() => {
+  const handleHostOnline = useCallback(async () => {
+    await ensureAssetsReady();
     const roomId = generateRoomCode();
     const url = new URL(window.location.href);
     url.searchParams.set('room', roomId);
     window.history.replaceState({}, '', url.toString());
     rememberRoleForRoom(roomId, 'host');
     setOnline({ roomId, role: 'host' });
-    handleStartGame();
-  }, [handleStartGame]);
+    setPower(65);
+    setScoreHighlightPlayer(0);
+    previousScoresRef.current = { player1: 0, player2: 0 };
+    setGameState(initialGameState);
+    setScoreLog([]);
+    setGameSession((session) => session + 1);
+    setHasStartedGame(true);
+  }, [ensureAssetsReady]);
 
-  const handleJoinOnline = useCallback(() => {
+  const handleJoinOnline = useCallback(async () => {
     if (!online) return;
+    await ensureAssetsReady();
     rememberRoleForRoom(online.roomId, online.role);
     setPower(65);
     setScoreHighlightPlayer(0);
@@ -201,7 +237,7 @@ function App() {
     setGameState(initialGameState);
     setGameSession((session) => session + 1);
     setHasStartedGame(true);
-  }, [online]);
+  }, [ensureAssetsReady, online]);
 
   const handleCopyLink = useCallback(async () => {
     if (!online) return;
@@ -239,6 +275,23 @@ function App() {
     localPlayerSlot,
     game: online && hasStartedGame ? gameInstance : null,
   });
+
+  useEffect(() => {
+    const scrollEl = chatScrollRef.current;
+    if (!scrollEl) return;
+    scrollEl.scrollTop = scrollEl.scrollHeight;
+  }, [room.messages]);
+
+  const handleChatSubmit = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      const text = chatInput.trim();
+      if (!text) return;
+      room.sendChat(text);
+      setChatInput('');
+    },
+    [chatInput, room]
+  );
 
   useEffect(() => {
     const previousScores = previousScoresRef.current;
@@ -341,6 +394,7 @@ function App() {
     !room.rejected &&
     gameState.currentPlayer === localPlayerSlot &&
     !gameState.gameOver;
+  const assetsLoading = assetStatus === 'loading';
   const turnFrameColor = localPlayerSlot === 1 ? 'rgba(239,68,68,0.55)' : 'rgba(59,130,246,0.55)';
   const turnFrameGlow = localPlayerSlot === 1 ? 'rgba(239,68,68,0.18)' : 'rgba(59,130,246,0.18)';
 
@@ -380,9 +434,10 @@ function App() {
                   <button
                     type="button"
                     onClick={handleJoinOnline}
+                    disabled={assetsLoading}
                     className="inline-flex items-center justify-center rounded-full bg-blue-500 px-8 py-3 text-sm font-black uppercase tracking-[0.2em] text-white shadow-[0_15px_35px_rgba(59,130,246,0.45)] transition-transform duration-200 hover:scale-105 hover:bg-blue-400"
                   >
-                    {online.role === 'host' ? 'Rejoin match' : 'Join match'}
+                    {assetsLoading ? 'Loading assets...' : online.role === 'host' ? 'Rejoin match' : 'Join match'}
                   </button>
                   <button
                     type="button"
@@ -402,13 +457,15 @@ function App() {
                   <button
                     type="button"
                     onClick={handleStartGame}
+                    disabled={assetsLoading}
                     className="inline-flex items-center justify-center rounded-full bg-blue-500 px-8 py-3 text-sm font-black uppercase tracking-[0.2em] text-white shadow-[0_15px_35px_rgba(59,130,246,0.45)] transition-transform duration-200 hover:scale-105 hover:bg-blue-400"
                   >
-                    Play local (2 players)
+                    {assetsLoading ? 'Loading assets...' : 'Play local (2 players)'}
                   </button>
                   <button
                     type="button"
                     onClick={handleHostOnline}
+                    disabled={assetsLoading}
                     className="inline-flex items-center justify-center rounded-full border border-white/25 bg-white/5 px-6 py-2.5 text-xs font-bold uppercase tracking-[0.2em] text-white/85 hover:bg-white/15"
                   >
                     Play online — host a room
@@ -492,7 +549,7 @@ function App() {
       )}
 
       {online && hasStartedGame && !room.rejected && (
-        <div className="pointer-events-auto absolute right-4 top-1/2 z-30 w-[280px] -translate-y-1/2 rounded-xl border border-white/15 bg-black/75 px-4 py-3 text-xs backdrop-blur-sm">
+        <div className="pointer-events-auto absolute right-[16px] top-[34vh] z-30 w-[280px] rounded-xl border border-white/15 bg-black/75 px-4 py-3 text-xs backdrop-blur-sm">
           <div className="mb-2 flex items-center justify-between">
             <span className="font-bold uppercase tracking-[0.2em] text-white/70">
               {online.role === 'host' ? 'Hosting' : 'Joined'} · {online.roomId}
@@ -629,6 +686,57 @@ function App() {
         </div>
       </div>
 
+      {online && hasStartedGame && !room.rejected && (
+        <div className="pointer-events-auto absolute bottom-4 right-[245px] z-30 flex h-[18vh] max-h-[190px] w-[31.2vw] min-w-[280px] max-w-[320px] flex-col overflow-hidden rounded-[20px] border border-white/15 bg-black/68 shadow-[0_20px_45px_rgba(0,0,0,0.4)] backdrop-blur-sm">
+          <div className="flex items-center justify-between border-b border-white/10 px-4 py-2">
+            <span className="text-[11px] font-bold uppercase tracking-[0.24em] text-white/75">Chat</span>
+            <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/40">
+              {room.peerConnected ? 'Live' : 'Waiting'}
+            </span>
+          </div>
+          <div ref={chatScrollRef} className="flex-1 overflow-y-auto px-2 py-1.5 text-[11px] font-medium text-white/80">
+            {room.messages.length === 0 ? (
+              <div className="px-2 py-3 text-center text-[11px] font-semibold uppercase tracking-[0.18em] text-white/35">
+                No messages yet
+              </div>
+            ) : (
+              room.messages.map((message: ChatMessage) => {
+                const isMine = message.playerSlot === localPlayerSlot;
+                const senderLabel = message.playerSlot === 1 ? 'P1' : 'P2';
+                const bubbleClasses = isMine
+                  ? 'ml-8 border-emerald-400/25 bg-emerald-500/15 text-emerald-50'
+                  : 'mr-8 border-white/12 bg-white/8 text-white/82';
+                return (
+                  <div key={message.id} className={`my-1 rounded-lg border px-2.5 py-1.5 ${bubbleClasses}`}>
+                    <div className="mb-0.5 text-[9px] font-bold uppercase tracking-[0.16em] text-white/45">
+                      {isMine ? 'You' : senderLabel}
+                    </div>
+                    <div className="break-words leading-snug">{message.text}</div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+          <form onSubmit={handleChatSubmit} className="flex items-center gap-2 border-t border-white/10 p-2">
+            <input
+              type="text"
+              value={chatInput}
+              onChange={(event) => setChatInput(event.target.value.slice(0, 180))}
+              maxLength={180}
+              placeholder="Message opponent"
+              className="min-w-0 flex-1 rounded-md border border-white/12 bg-black/45 px-2.5 py-1.5 text-[11px] font-semibold text-white outline-none placeholder:text-white/30 focus:border-emerald-300/45"
+            />
+            <button
+              type="submit"
+              disabled={chatInput.trim().length === 0}
+              className="rounded-md border border-emerald-300/25 bg-emerald-500/18 px-3 py-1.5 text-[10px] font-black uppercase tracking-[0.14em] text-emerald-100 hover:bg-emerald-500/28 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/5 disabled:text-white/25"
+            >
+              Send
+            </button>
+          </form>
+        </div>
+      )}
+
       {dragLine && !hideOpponentAim && (
         <svg className="pointer-events-none absolute inset-0 z-20 h-full w-full">
           <defs>
@@ -757,7 +865,7 @@ function App() {
         </div>
       </div>
 
-      <div className="absolute bottom-4 right-4 z-10 w-[220px] rounded-xl border border-gray-700 bg-black/68 px-5 py-4 backdrop-blur-[1px]">
+      <div className="absolute bottom-4 right-4 z-40 w-[220px] rounded-xl border border-gray-700 bg-black/68 px-5 py-4 backdrop-blur-[1px]">
         <div className="mb-3 text-left">
           <div className="text-xs font-bold uppercase tracking-wider text-gray-400">Throw Style</div>
           <div className="text-sm font-semibold text-white">{throwStyleLabel}</div>
@@ -772,29 +880,37 @@ function App() {
           id="bag-preview-viewport"
           className="mb-4 h-[132px] rounded-[22px] border border-white/10 bg-black/8 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
         />
-        <label className="mb-3 flex cursor-pointer items-center gap-3 text-left">
-          <input
-            type="checkbox"
-            checked={cinematicCameraEnabled}
-            onChange={(event) => setCinematicCameraEnabled(event.target.checked)}
-            className="h-4 w-4 rounded border-gray-500 bg-black/40 text-blue-400"
-          />
+        <label className="mb-3 flex cursor-pointer items-center justify-between gap-3 text-left">
           <span>
             <div className="text-xs font-bold uppercase tracking-wider text-gray-400">Cinematic Camera</div>
             <div className="text-[11px] text-gray-400">Follow the bag after release</div>
           </span>
+          <div className="relative shrink-0">
+            <input
+              type="checkbox"
+              checked={cinematicCameraEnabled}
+              onChange={(event) => setCinematicCameraEnabled(event.target.checked)}
+              className="peer sr-only"
+            />
+            <div className="h-6 w-11 rounded-full bg-white/10 transition-colors peer-checked:bg-blue-500/70" />
+            <div className="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white/80 shadow-md transition-transform peer-checked:translate-x-5" />
+          </div>
         </label>
-        <label className="mb-3 flex cursor-pointer items-center gap-3 text-left">
-          <input
-            type="checkbox"
-            checked={holeColliderDebugVisible}
-            onChange={(event) => setHoleColliderDebugVisible(event.target.checked)}
-            className="h-4 w-4 rounded border-gray-500 bg-black/40 text-pink-400"
-          />
+        <label className="mb-3 flex cursor-pointer items-center justify-between gap-3 text-left">
           <span>
             <div className="text-xs font-bold uppercase tracking-wider text-gray-400">Show Colliders</div>
             <div className="text-[11px] text-gray-400">Debug: visualize all physics colliders + hole trigger</div>
           </span>
+          <div className="relative shrink-0">
+            <input
+              type="checkbox"
+              checked={holeColliderDebugVisible}
+              onChange={(event) => setHoleColliderDebugVisible(event.target.checked)}
+              className="peer sr-only"
+            />
+            <div className="h-6 w-11 rounded-full bg-white/10 transition-colors peer-checked:bg-pink-500/70" />
+            <div className="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white/80 shadow-md transition-transform peer-checked:translate-x-5" />
+          </div>
         </label>
         <div className="text-[11px] text-gray-400">Speed now appears above your pull point while aiming.</div>
       </div>
@@ -803,7 +919,7 @@ function App() {
         <div className="pointer-events-none absolute bottom-24 left-1/2 z-20 -translate-x-1/2">
           <div className="rounded-full border border-white/20 bg-black/70 px-6 py-2 backdrop-blur-sm">
             <span className="text-sm font-medium text-white/80">
-              ←/→ to move. Hold C to inspect the hole. Click and drag back for power, release to lock angle
+              ←/→ to step out. Hold C to inspect the hole. Click and drag back for power, release to lock trajectory
             </span>
           </div>
         </div>
