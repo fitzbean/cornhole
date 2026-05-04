@@ -3704,7 +3704,6 @@ export class CornholeGame {
       // the intent and drive the authoritative throw on release.
       this.updateAimFromDrag();
       this.emitState();
-      this.onLocalIntent?.({ type: 'dragMove', ndcX: ndc.x, ndcY: ndc.y });
       return;
     }
 
