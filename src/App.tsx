@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import type { FormEvent } from 'react';
-import { BagSide, CornholeGame, GameState } from './CornholeGame';
+// highlight-next-line
+import { BagSide, CornholeGame, GameState, KeyAction, DEFAULT_KEYBINDS } from './CornholeGame';
 import { useRoom } from './net/useRoom';
 import {
   buildRoomUrl,
@@ -26,7 +27,7 @@ const initialGameState: GameState = {
   dragStartY: 0.5,
   dragCurrentX: 0.5,
   dragCurrentY: 0.5,
-  message: 'Use left/right arrows to move. Hold C to inspect the hole. Pull for distance, release to lock speed.',
+  message: '',
   player1Score: 0,
   player2Score: 0,
   player1Ppr: 0,
@@ -67,6 +68,23 @@ function App() {
   const [scoreHighlightPlayer, setScoreHighlightPlayer] = useState<0 | 1 | 2>(0);
   const [cinematicCameraEnabled, setCinematicCameraEnabled] = useState(() => localStorage.getItem('cinematicCameraEnabled') === 'true');
   const [holeColliderDebugVisible, setHoleColliderDebugVisible] = useState(() => localStorage.getItem('holeColliderDebugVisible') === 'true');
+// highlight-next-line
+// highlight-next-line
+  const [weatherEnabled, setWeatherEnabled] = useState(() => localStorage.getItem('weatherEnabled') !== 'false');
+  const [keybinds, setKeybinds] = useState<Record<KeyAction, string>>(() => {
+    const stored = localStorage.getItem('keybinds');
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored);
+        return { ...DEFAULT_KEYBINDS, ...parsed };
+      } catch {
+        return { ...DEFAULT_KEYBINDS };
+      }
+    }
+    return { ...DEFAULT_KEYBINDS };
+  });
+  const [listeningFor, setListeningFor] = useState<KeyAction | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [hasStartedGame, setHasStartedGame] = useState(false);
   const [gameSession, setGameSession] = useState(0);
   const [gameInstance, setGameInstance] = useState<CornholeGame | null>(null);
@@ -142,6 +160,7 @@ function App() {
     game.onInningComplete = handleInningComplete;
     game.setCinematicCameraEnabled(cinematicCameraEnabled);
     game.setHoleColliderDebugVisible(holeColliderDebugVisible);
+    game.setWeatherEnabled(weatherEnabled);
     game.setupControls(canvas);
 
     gameRef.current = game;
@@ -163,6 +182,30 @@ function App() {
     gameRef.current?.setHoleColliderDebugVisible(holeColliderDebugVisible);
     localStorage.setItem('holeColliderDebugVisible', String(holeColliderDebugVisible));
   }, [holeColliderDebugVisible]);
+
+// highlight-next-line
+  useEffect(() => {
+    gameRef.current?.setWeatherEnabled(weatherEnabled);
+    localStorage.setItem('weatherEnabled', String(weatherEnabled));
+  }, [weatherEnabled]);
+
+// highlight-next-line
+  useEffect(() => {
+    gameRef.current?.setKeybinds(keybinds);
+    localStorage.setItem('keybinds', JSON.stringify(keybinds));
+  }, [keybinds]);
+
+  // Capture new keybind when listening
+  useEffect(() => {
+    if (!listeningFor) return;
+    const handler = (e: KeyboardEvent) => {
+      e.preventDefault();
+      setKeybinds((prev) => ({ ...prev, [listeningFor]: e.code }));
+      setListeningFor(null);
+    };
+    window.addEventListener('keydown', handler, { once: true });
+    return () => window.removeEventListener('keydown', handler);
+  }, [listeningFor]);
 
   useEffect(() => {
     if (!gameState.gameOver) {
@@ -451,7 +494,7 @@ function App() {
             ) : (
               <>
                 <p className="mx-auto mb-8 max-w-md text-sm text-gray-300">
-                  Sink bags, land on the board, and race to 21. Use the arrow keys to move, hold C to inspect the hole, pull to throw, and press F to flip the bag side.
+                  Standard Rules Apply. First to 21.
                 </p>
                 <div className="flex flex-col items-center gap-3">
                   <button
@@ -866,6 +909,16 @@ function App() {
       </div>
 
       <div className="absolute bottom-4 right-4 z-40 w-[220px] rounded-xl border border-gray-700 bg-black/68 px-5 py-4 backdrop-blur-[1px]">
+        <button
+          onClick={() => setSettingsOpen(true)}
+          className="absolute top-2 right-2 flex items-center justify-center rounded-full bg-black/60 p-2 backdrop-blur transition-colors hover:bg-black/80"
+          aria-label="Settings"
+        >
+          <svg className="h-4 w-4 text-white/70" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 0 0-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 0 0-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 0 0-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 0 0-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 0 0 1.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0z" />
+          </svg>
+        </button>
         <div className="mb-3 text-left">
           <div className="text-xs font-bold uppercase tracking-wider text-gray-400">Throw Style</div>
           <div className="text-sm font-semibold text-white">{throwStyleLabel}</div>
@@ -880,46 +933,119 @@ function App() {
           id="bag-preview-viewport"
           className="mb-4 h-[132px] rounded-[22px] border border-white/10 bg-black/8 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
         />
-        <label className="mb-3 flex cursor-pointer items-center justify-between gap-3 text-left">
-          <span>
-            <div className="text-xs font-bold uppercase tracking-wider text-gray-400">Cinematic Camera</div>
-            <div className="text-[11px] text-gray-400">Follow the bag after release</div>
-          </span>
-          <div className="relative shrink-0">
-            <input
-              type="checkbox"
-              checked={cinematicCameraEnabled}
-              onChange={(event) => setCinematicCameraEnabled(event.target.checked)}
-              className="peer sr-only"
-            />
-            <div className="h-6 w-11 rounded-full bg-white/10 transition-colors peer-checked:bg-blue-500/70" />
-            <div className="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white/80 shadow-md transition-transform peer-checked:translate-x-5" />
-          </div>
-        </label>
-        <label className="mb-3 flex cursor-pointer items-center justify-between gap-3 text-left">
-          <span>
-            <div className="text-xs font-bold uppercase tracking-wider text-gray-400">Show Colliders</div>
-            <div className="text-[11px] text-gray-400">Debug: visualize all physics colliders + hole trigger</div>
-          </span>
-          <div className="relative shrink-0">
-            <input
-              type="checkbox"
-              checked={holeColliderDebugVisible}
-              onChange={(event) => setHoleColliderDebugVisible(event.target.checked)}
-              className="peer sr-only"
-            />
-            <div className="h-6 w-11 rounded-full bg-white/10 transition-colors peer-checked:bg-pink-500/70" />
-            <div className="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white/80 shadow-md transition-transform peer-checked:translate-x-5" />
-          </div>
-        </label>
         <div className="text-[11px] text-gray-400">Speed now appears above your pull point while aiming.</div>
       </div>
+
+      {/* Settings Modal */}
+      {settingsOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" onClick={() => setSettingsOpen(false)}>
+          <div className="rounded-xl border border-gray-700 bg-black/85 p-6 shadow-2xl backdrop-blur-sm" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-lg font-bold text-white">Settings</h3>
+              <button onClick={() => setSettingsOpen(false)} className="text-white/50 hover:text-white">
+                <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                  <path d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="space-y-4">
+              <label className="flex cursor-pointer items-center justify-between gap-3">
+                <span>
+                  <div className="text-sm font-semibold text-white">Cinematic Camera</div>
+                  <div className="text-xs text-gray-400">Follow the bag after release</div>
+                </span>
+                <div className="relative">
+                  <input
+                    type="checkbox"
+                    checked={cinematicCameraEnabled}
+                    onChange={(event) => setCinematicCameraEnabled(event.target.checked)}
+                    className="peer sr-only"
+                  />
+                  <div className="h-6 w-11 rounded-full bg-white/10 transition-colors peer-checked:bg-blue-500/70" />
+                  <div className="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white/80 shadow-md transition-transform peer-checked:translate-x-5" />
+                </div>
+              </label>
+              <label className="flex cursor-pointer items-center justify-between gap-3">
+                <span>
+                  <div className="text-sm font-semibold text-white">Show Colliders</div>
+                  <div className="text-xs text-gray-400">Debug: visualize all physics colliders + hole trigger</div>
+                </span>
+                <div className="relative">
+                  <input
+                    type="checkbox"
+                    checked={holeColliderDebugVisible}
+                    onChange={(event) => setHoleColliderDebugVisible(event.target.checked)}
+                    className="peer sr-only"
+                  />
+                  <div className="h-6 w-11 rounded-full bg-white/10 transition-colors peer-checked:bg-pink-500/70" />
+                  <div className="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white/80 shadow-md transition-transform peer-checked:translate-x-5" />
+                </div>
+              </label>
+              <label className="flex cursor-pointer items-center justify-between gap-3">
+                <span>
+                  <div className="text-sm font-semibold text-white">Weather Effects</div>
+                  <div className="text-xs text-gray-400">Temperature, humidity, and wind affect throws</div>
+                </span>
+                <div className="relative">
+                  <input
+                    type="checkbox"
+                    checked={weatherEnabled}
+                    onChange={(event) => setWeatherEnabled(event.target.checked)}
+                    className="peer sr-only"
+                  />
+                  <div className="h-6 w-11 rounded-full bg-white/10 transition-colors peer-checked:bg-cyan-500/70" />
+// highlight-next-line
+                  <div className="absolute left-0.5 top-0.5 h-5 w-5 rounded-full bg-white/80 shadow-md transition-transform peer-checked:translate-x-5" />
+                </div>
+              </label>
+
+              {/* Keybind Customization Section */}
+              <div className="mt-4 border-t border-white/10 pt-4">
+                <div className="mb-2 text-sm font-semibold text-white">Keybinds</div>
+                <div className="space-y-2 text-xs">
+                  {(
+                    [
+                      ['moveLeft', 'Move Left'],
+                      ['moveRight', 'Move Right'],
+                      ['inspect', 'Inspect Hole'],
+                      ['flipBag', 'Flip Bag Side'],
+                      ['toggleThrow', 'Toggle Throw Style'],
+                      ['toggleWeather', 'Toggle Weather'],
+                      ['cycleBoard', 'Cycle Board'],
+                      ['toggleSlowMo', 'Toggle Slow Motion'],
+                    ] as const
+                  ).map(([action, label]) => (
+                    <div key={action} className="flex items-center justify-between gap-3">
+                      <span className="text-white/80">{label}</span>
+                      <button
+                        onClick={() => setListeningFor(action)}
+                        className="rounded border border-white/20 bg-white/5 px-2 py-0.5 font-mono text-[10px] text-white hover:bg-white/10"
+                      >
+                        {listeningFor === action ? 'Press key...' : keybinds[action]}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <button
+                  onClick={() => {
+                    setKeybinds({ ...DEFAULT_KEYBINDS });
+                    setListeningFor(null);
+                  }}
+                  className="mt-2 text-[10px] text-white/60 hover:text-white"
+                >
+                  Reset to defaults
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {gameState.isAiming && !gameState.isThrowing && gameState.bagsRemaining > 0 && !gameState.gameOver && (
         <div className="pointer-events-none absolute bottom-24 left-1/2 z-20 -translate-x-1/2">
           <div className="rounded-full border border-white/20 bg-black/70 px-6 py-2 backdrop-blur-sm">
             <span className="text-sm font-medium text-white/80">
-              ←/→ to step out. Hold C to inspect the hole. Click and drag back for power, release to lock trajectory
+              ←/→ to step out. Click and drag back for power, release to lock trajectory
             </span>
           </div>
         </div>

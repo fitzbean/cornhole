@@ -99,8 +99,36 @@ const RESTITUTION = {
   BAG_BAG: 0.001,
 } as const;
 
+// highlight-next-line
 export type BagSide = 'sticky' | 'slick';
 export type ThrowStyle = 'slide' | 'roll';
+// highlight-next-line
+export type KeyAction =
+  | 'moveLeft'
+  | 'moveRight'
+  | 'moveUp'
+  | 'moveDown'
+  | 'inspect'
+  | 'resetCamera'
+  | 'flipBag'
+  | 'toggleThrow'
+  | 'toggleWeather'
+  | 'cycleBoard'
+  | 'toggleSlowMo';
+
+export const DEFAULT_KEYBINDS: Record<KeyAction, string> = {
+  moveLeft: 'ArrowLeft',
+  moveRight: 'ArrowRight',
+  moveUp: 'ArrowUp',
+  moveDown: 'ArrowDown',
+  inspect: 'KeyC',
+  resetCamera: 'KeyR',
+  flipBag: 'KeyF',
+  toggleThrow: 'KeyT',
+  toggleWeather: 'KeyW',
+  cycleBoard: 'KeyB',
+  toggleSlowMo: 'KeyS',
+};
 
 interface BagVisualState {
   squash: number;
@@ -327,11 +355,13 @@ export class CornholeGame {
   turnStartCameraPosition = new THREE.Vector3(0, 1.95, 12);
   turnStartCameraLookTarget = new THREE.Vector3(0, 1.05, -8);
   freeRoamLookActive = false;
+// highlight-next-line
   freeRoamLookLastPointer = new THREE.Vector2();
   freeRoamYaw = 0;
   freeRoamPitch = -0.18;
   cinematicCameraEnabled = false;
   holeColliderDebug: THREE.Object3D | null = null;
+  keybinds: Record<KeyAction, string> = { ...DEFAULT_KEYBINDS };
   physicsDebugGroup: THREE.Group | null = null;
   physicsDebugVisible = false;
   physicsDebugMeshes: Array<{
@@ -2373,6 +2403,20 @@ export class CornholeGame {
     }
   }
 
+// highlight-next-line
+  setWeatherEnabled(enabled: boolean) {
+    this.weatherEnabled = enabled;
+  }
+
+// highlight-next-line
+  setKeybinds(keybinds: Record<KeyAction, string>) {
+    this.keybinds = { ...keybinds };
+  }
+
+  private matches(action: KeyAction, code: string): boolean {
+    return this.keybinds[action] === code;
+  }
+
   // Build (or rebuild) wireframe meshes for every shape on every physics body
   // in the world. Bodies are lightweight enough to rebuild on toggle. Shape
   // transforms are synced each frame in `syncPhysicsDebugMeshes`.
@@ -3544,6 +3588,16 @@ export class CornholeGame {
     }
   }
 
+  endHoleInspection() {
+    this.inspectCameraHeld = false;
+    this.freeRoamCameraEnabled = false;
+    this.freeRoamLookActive = false;
+    this.state.message = 'Pull for distance, release to lock speed.';
+    if (document.pointerLockElement === this.renderer.domElement) {
+      document.exitPointerLock();
+    }
+  }
+
   updateCamera(dt: number) {
     if (this.inspectCameraHeld) {
       const inspectDirection = new THREE.Vector3().subVectors(this.cameraLookTarget, this.cameraPosition);
@@ -3663,6 +3717,14 @@ export class CornholeGame {
   handleMouseDown = (event: MouseEvent) => {
     if (this.inspectCameraHeld) return;
 
+    // Middle mouse button (button === 1) for hole inspection
+    if (event.button === 1 && !this.isDragging && !this.freeRoamCameraEnabled) {
+      this.inspectCameraHeld = true;
+      this.beginHoleInspection();
+      event.preventDefault();
+      return;
+    }
+
     if (this.freeRoamCameraEnabled) {
       this.freeRoamLookActive = true;
       this.freeRoamLookLastPointer.set(event.clientX, event.clientY);
@@ -3699,6 +3761,13 @@ export class CornholeGame {
   };
 
   handleMouseUp = (event: MouseEvent) => {
+    // Middle mouse button release for hole inspection
+    if (event.button === 1 && this.inspectCameraHeld) {
+      this.inspectCameraHeld = false;
+      this.endHoleInspection();
+      return;
+    }
+
     if (this.inspectCameraHeld) return;
 
     if (this.freeRoamCameraEnabled) {
@@ -3748,7 +3817,11 @@ export class CornholeGame {
   };
 
   handleMouseLeave = () => {
-    if (this.inspectCameraHeld) return;
+    // Middle mouse button release for hole inspection
+    if (this.inspectCameraHeld) {
+      this.endHoleInspection();
+      return;
+    }
 
     if (this.freeRoamCameraEnabled) {
       this.freeRoamLookActive = false;
@@ -3789,33 +3862,34 @@ export class CornholeGame {
     event.preventDefault();
   };
 
+// highlight-next-line
   handleKeyDown = (event: KeyboardEvent) => {
     if (this.guestMode) {
-      if (event.code === 'ArrowLeft') {
+      if (this.matches('moveLeft', event.code)) {
         this.onLocalIntent?.({ type: 'moveStart', direction: 'left' });
         event.preventDefault();
         return;
-      } else if (event.code === 'ArrowRight') {
+      } else if (this.matches('moveRight', event.code)) {
         this.onLocalIntent?.({ type: 'moveStart', direction: 'right' });
         event.preventDefault();
         return;
-      } else if (event.code === 'KeyF' && !event.repeat) {
+      } else if (this.matches('flipBag', event.code) && !event.repeat) {
         this.onLocalIntent?.({ type: 'flipBagSide' });
         event.preventDefault();
         return;
-      } else if (event.code === 'KeyT' && !event.repeat) {
+      } else if (this.matches('toggleThrow', event.code) && !event.repeat) {
         this.onLocalIntent?.({ type: 'toggleThrowStyle' });
         event.preventDefault();
         return;
-      } else if (event.code === 'KeyW' && !event.repeat) {
+      } else if (this.matches('toggleWeather', event.code) && !event.repeat) {
         this.onLocalIntent?.({ type: 'toggleWeather' });
         event.preventDefault();
         return;
-      } else if (event.code === 'KeyB' && !event.repeat) {
+      } else if (this.matches('cycleBoard', event.code) && !event.repeat) {
         this.cycleBoardTexture();
         event.preventDefault();
         return;
-      } else if (event.code === 'KeyC' && !event.repeat && !this.isDragging) {
+      } else if (this.matches('inspect', event.code) && !event.repeat && !this.isDragging) {
         this.inspectCameraHeld = true;
         this.beginHoleInspection();
         event.preventDefault();
@@ -3824,29 +3898,29 @@ export class CornholeGame {
       // Let other keys fall through for local camera controls.
     }
     const blockTurnInput = this.onlineHostMode && !this.ownsCurrentTurn();
-    if (event.code === 'ArrowLeft') {
+    if (this.matches('moveLeft', event.code)) {
       if (blockTurnInput) { event.preventDefault(); return; }
       this.moveLeftPressed = true;
       event.preventDefault();
-    } else if (event.code === 'ArrowRight') {
+    } else if (this.matches('moveRight', event.code)) {
       if (blockTurnInput) { event.preventDefault(); return; }
       this.moveRightPressed = true;
       event.preventDefault();
-    } else if (event.code === 'ArrowUp') {
+    } else if (this.matches('moveUp', event.code)) {
       if (blockTurnInput) { event.preventDefault(); return; }
       this.moveUpPressed = true;
       event.preventDefault();
-    } else if (event.code === 'ArrowDown') {
+    } else if (this.matches('moveDown', event.code)) {
       if (blockTurnInput) { event.preventDefault(); return; }
       this.moveDownPressed = true;
       event.preventDefault();
-    } else if (event.code === 'KeyC' && !event.repeat && !this.isDragging) {
+    } else if (this.matches('inspect', event.code) && !event.repeat && !this.isDragging) {
       this.inspectCameraHeld = true;
       this.beginHoleInspection();
       this.state.message = 'Inspecting the hole. Move the mouse to look around.';
       this.emitState();
       event.preventDefault();
-    } else if (event.code === 'KeyR') {
+    } else if (this.matches('resetCamera', event.code)) {
       this.freeRoamCameraEnabled = false;
       this.inspectCameraHeld = false;
       this.freeRoamLookActive = false;
@@ -3858,7 +3932,7 @@ export class CornholeGame {
       this.state.message = `${this.state.currentPlayer === 1 ? 'Player 1' : 'Player 2'} camera reset.`;
       this.emitState();
       event.preventDefault();
-    } else if (event.code === 'KeyF' && this.state.isAiming && !this.state.isThrowing && !this.state.gameOver) {
+    } else if (this.matches('flipBag', event.code) && this.state.isAiming && !this.state.isThrowing && !this.state.gameOver) {
       if (blockTurnInput) { event.preventDefault(); return; }
       this.selectedBagSide = this.selectedBagSide === 'sticky' ? 'slick' : 'sticky';
       this.playerBagSides[this.state.currentPlayer] = this.selectedBagSide;
@@ -3866,7 +3940,7 @@ export class CornholeGame {
       this.state.bagPreviewSide = this.selectedBagSide;
       this.emitState();
       event.preventDefault();
-    } else if (event.code === 'KeyT' && this.state.isAiming && !this.state.isThrowing && !this.state.gameOver) {
+    } else if (this.matches('toggleThrow', event.code) && this.state.isAiming && !this.state.isThrowing && !this.state.gameOver) {
       if (blockTurnInput) { event.preventDefault(); return; }
       this.throwStyle = this.throwStyle === 'slide' ? 'roll' : 'slide';
       this.playerThrowStyles[this.state.currentPlayer] = this.throwStyle;
@@ -3875,14 +3949,14 @@ export class CornholeGame {
       this.state.message = `Throw style: ${this.throwStyle === 'slide' ? 'Slide' : 'Roll'}`;
       this.emitState();
       event.preventDefault();
-    } else if (event.code === 'KeyW' && !event.repeat) {
+    } else if (this.matches('toggleWeather', event.code) && !event.repeat) {
       this.weatherEnabled = !this.weatherEnabled;
       this.emitState();
       event.preventDefault();
-    } else if (event.code === 'KeyB' && !event.repeat) {
+    } else if (this.matches('cycleBoard', event.code) && !event.repeat) {
       this.cycleBoardTexture();
       event.preventDefault();
-    } else if (event.code === 'KeyS' && !event.repeat) {
+    } else if (this.matches('toggleSlowMo', event.code) && !event.repeat) {
       this.slowMotionEnabled = !this.slowMotionEnabled;
       this.state.message = this.slowMotionEnabled ? 'Slow motion ON' : 'Slow motion OFF';
       this.emitState();
@@ -3890,35 +3964,36 @@ export class CornholeGame {
     }
   };
 
+// highlight-next-line
   handleKeyUp = (event: KeyboardEvent) => {
     if (this.guestMode) {
-      if (event.code === 'ArrowLeft') {
+      if (this.matches('moveLeft', event.code)) {
         this.onLocalIntent?.({ type: 'moveStop', direction: 'left' });
         event.preventDefault();
         return;
-      } else if (event.code === 'ArrowRight') {
+      } else if (this.matches('moveRight', event.code)) {
         this.onLocalIntent?.({ type: 'moveStop', direction: 'right' });
         event.preventDefault();
         return;
-      } else if (event.code === 'KeyC') {
+      } else if (this.matches('inspect', event.code)) {
         this.inspectCameraHeld = false;
         event.preventDefault();
         return;
       }
     }
-    if (event.code === 'ArrowLeft') {
+    if (this.matches('moveLeft', event.code)) {
       this.moveLeftPressed = false;
       event.preventDefault();
-    } else if (event.code === 'ArrowRight') {
+    } else if (this.matches('moveRight', event.code)) {
       this.moveRightPressed = false;
       event.preventDefault();
-    } else if (event.code === 'ArrowUp') {
+    } else if (this.matches('moveUp', event.code)) {
       this.moveUpPressed = false;
       event.preventDefault();
-    } else if (event.code === 'ArrowDown') {
+    } else if (this.matches('moveDown', event.code)) {
       this.moveDownPressed = false;
       event.preventDefault();
-    } else if (event.code === 'KeyC') {
+    } else if (this.matches('inspect', event.code)) {
       this.inspectCameraHeld = false;
       if (document.pointerLockElement === this.renderer.domElement) {
         document.exitPointerLock?.();
