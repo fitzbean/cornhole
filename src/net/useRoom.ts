@@ -19,8 +19,8 @@ export interface RoomHandle {
   sendChat(text: string): void;
 }
 
-const HEARTBEAT_INTERVAL_MS = 1000;
-const PEER_TIMEOUT_MS = 3500;
+const HEARTBEAT_INTERVAL_MS = 10000;
+const PEER_TIMEOUT_MS = 30000;
 
 function newClientId(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
