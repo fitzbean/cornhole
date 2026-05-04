@@ -35,7 +35,7 @@ const INSPECT_CAMERA_MAX_DISTANCE = 7.5;
 // snapshot to interpolate toward. Adds a small perceived latency but removes
 // the arrive-and-wait stepping that straight-to-latest lerping produces.
 const GUEST_RENDER_DELAY = 0.08;
-const BROADCAST_INTERVAL = 0.025; // 20Hz cap
+const BROADCAST_INTERVAL = 0.05; // 20Hz cap
 const PLAYER_DEFAULT_X: Record<1 | 2, number> = {
   1: -1.15,
   2: 1.15,
@@ -4049,7 +4049,7 @@ export class CornholeGame {
       // pull-back would just fill the 20Hz broadcast budget with invisible
       // updates, starving real transitions. The throw release still flips
       // isThrowing and clears isDragging, which broadcasts normally.
-      if (!this.state.isDragging) {
+      if (!this.state.isDragging && (!this.state.isAiming || this.state.isThrowing || this.state.isSettling || this.state.showResult || this.state.gameOver)) {
         this.requestBroadcast('full');
       }
     }

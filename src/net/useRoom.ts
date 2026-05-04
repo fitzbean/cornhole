@@ -107,7 +107,6 @@ export function useRoom({ roomId, role, localPlayerSlot, game }: RoomOptions): R
 
         // role === 'guest'
         markPeerAlive();
-        transport.send({ kind: 'hello', from: role, playerSlot: localPlayerSlot, roomId, clientId });
         // A host rejoining spawns a fresh CornholeGame whose snapshotSeq starts at 0.
         // Reset our counter so we accept the next snapshot instead of rejecting it.
         game.snapshotSeq = 0;
@@ -139,7 +138,7 @@ export function useRoom({ roomId, role, localPlayerSlot, game }: RoomOptions): R
 
     const unsubStatus = transport.onStatusChange((s) => {
       setStatus(s);
-      if (s === 'connected') {
+      if (s === 'connected' && role === 'guest') {
         transport.send({ kind: 'hello', from: role, playerSlot: localPlayerSlot, roomId, clientId });
       } else {
         setPeerConnected(false);
