@@ -595,7 +595,7 @@ function App() {
         <div className="pointer-events-auto absolute right-[16px] top-[34vh] z-30 w-[280px] rounded-xl border border-white/15 bg-black/75 px-4 py-3 text-xs backdrop-blur-sm">
           <div className="mb-2 flex items-center justify-between">
             <span className="font-bold uppercase tracking-[0.2em] text-white/70">
-              {online.role === 'host' ? 'Hosting' : 'Joined'} · {online.roomId}
+              {online.role === 'host' ? 'Host' : 'Guest'} · {online.roomId}
             </span>
             <span
               className={`rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider ${
@@ -638,6 +638,9 @@ function App() {
           </div>
           <div className="mt-1 text-[11px] text-gray-400">
             {gameState.currentPlayer === localPlayerSlot ? 'Your turn' : 'Waiting on opponent'}
+          </div>
+          <div className="mt-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-white/35">
+            Msgs S/R: <span className="tabular-nums text-white/55">{room.messagesSent}/{room.messagesReceived}</span>
           </div>
           {online.role === 'host' && (
             <div className="mt-3 flex items-center gap-2">

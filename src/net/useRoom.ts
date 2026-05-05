@@ -15,6 +15,8 @@ export interface RoomHandle {
   status: ConnectionStatus;
   peerConnected: boolean;
   rejected: boolean;
+  messagesSent: number;
+  messagesReceived: number;
   messages: ChatMessage[];
   sendChat(text: string): void;
 }
@@ -30,6 +32,8 @@ export function useRoom({ roomId, role, localPlayerSlot, game }: RoomOptions): R
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [peerConnected, setPeerConnected] = useState(false);
   const [rejected, setRejected] = useState(false);
+  const [messagesSent, setMessagesSent] = useState(0);
+  const [messagesReceived, setMessagesReceived] = useState(0);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const transportRef = useRef<Transport | null>(null);
   const clientIdRef = useRef<string>(newClientId());
@@ -38,6 +42,8 @@ export function useRoom({ roomId, role, localPlayerSlot, game }: RoomOptions): R
     setMessages([]);
     setRejected(false);
     setPeerConnected(false);
+    setMessagesSent(0);
+    setMessagesReceived(0);
   }, [roomId, role, game]);
 
   useEffect(() => {
@@ -54,14 +60,14 @@ export function useRoom({ roomId, role, localPlayerSlot, game }: RoomOptions): R
     if (role === 'host') {
       game.setHostMode(localPlayerSlot, true);
       game.onSnapshot = (snapshot: Snapshot) => {
-        transport.send({ kind: 'snapshot', from: 'host', snapshot, clientId });
+        send({ kind: 'snapshot', from: 'host', snapshot, clientId });
       };
       game.onLocalIntent = null;
     } else {
       game.setGuestMode(true, localPlayerSlot);
       game.onSnapshot = null;
       game.onLocalIntent = (intent: Intent) => {
-        transport.send({ kind: 'intent', from: 'guest', intent, ts: Date.now(), clientId });
+        send({ kind: 'intent', from: 'guest', intent, ts: Date.now(), clientId });
       };
     }
 
@@ -70,12 +76,18 @@ export function useRoom({ roomId, role, localPlayerSlot, game }: RoomOptions): R
     let lastPeerMessageAt = 0;
     let peerAliveChecker: number | null = null;
 
+    const send = (envelope: Envelope) => {
+      transport.send(envelope);
+      setMessagesSent((count) => count + 1);
+    };
+
     const markPeerAlive = () => {
       lastPeerMessageAt = Date.now();
       setPeerConnected(true);
     };
 
     const unsubMessage = transport.onMessage((envelope: Envelope) => {
+      setMessagesReceived((count) => count + 1);
       if (envelope.kind === 'roomFull') {
         if (role === 'guest' && envelope.toClientId === clientId) {
           setRejected(true);
@@ -86,22 +98,11 @@ export function useRoom({ roomId, role, localPlayerSlot, game }: RoomOptions): R
 
       if (envelope.kind === 'hello') {
         if (role === 'host') {
-          // Allow the first guest in, or let the same guest rejoin after refresh.
-          // If a *different* guest is already active (recent heartbeat), refuse.
-          const peerStillAlive =
-            acceptedPeerClientId !== null &&
-            acceptedPeerClientId !== envelope.clientId &&
-            lastPeerMessageAt !== 0 &&
-            Date.now() - lastPeerMessageAt < PEER_TIMEOUT_MS;
-          if (peerStillAlive) {
-            transport.send({ kind: 'roomFull', from: 'host', toClientId: envelope.clientId });
-            return;
-          }
           acceptedPeerClientId = envelope.clientId;
           markPeerAlive();
-          transport.send({ kind: 'hello', from: role, playerSlot: localPlayerSlot, roomId, clientId });
+          send({ kind: 'hello', from: role, playerSlot: localPlayerSlot, roomId, clientId });
           const snapshot = game.serializeSnapshot();
-          transport.send({ kind: 'snapshot', from: 'host', snapshot, clientId });
+          send({ kind: 'snapshot', from: 'host', snapshot, clientId });
           return;
         }
 
@@ -139,14 +140,14 @@ export function useRoom({ roomId, role, localPlayerSlot, game }: RoomOptions): R
     const unsubStatus = transport.onStatusChange((s) => {
       setStatus(s);
       if (s === 'connected' && role === 'guest') {
-        transport.send({ kind: 'hello', from: role, playerSlot: localPlayerSlot, roomId, clientId });
+        send({ kind: 'hello', from: role, playerSlot: localPlayerSlot, roomId, clientId });
       } else {
         setPeerConnected(false);
       }
     });
 
     const heartbeatTimer = window.setInterval(() => {
-      transport.send({ kind: 'heartbeat', from: role, ts: Date.now(), clientId });
+      send({ kind: 'heartbeat', from: role, ts: Date.now(), clientId });
     }, HEARTBEAT_INTERVAL_MS);
 
     peerAliveChecker = window.setInterval(() => {
@@ -190,7 +191,8 @@ export function useRoom({ roomId, role, localPlayerSlot, game }: RoomOptions): R
     };
     setMessages((prev) => [...prev, message].slice(-80));
     transportRef.current.send({ kind: 'chat', from: role, message, clientId: clientIdRef.current });
+    setMessagesSent((count) => count + 1);
   };
 
-  return { status, peerConnected, rejected, messages, sendChat };
+  return { status, peerConnected, rejected, messagesSent, messagesReceived, messages, sendChat };
 }

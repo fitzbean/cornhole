@@ -34,8 +34,8 @@ const INSPECT_CAMERA_MAX_DISTANCE = 7.5;
 // Guest renders `now - GUEST_RENDER_DELAY` so there's almost always a future
 // snapshot to interpolate toward. Adds a small perceived latency but removes
 // the arrive-and-wait stepping that straight-to-latest lerping produces.
-const GUEST_RENDER_DELAY = 0.16;
-const BROADCAST_INTERVAL = 0.1; // 10Hz cap
+const GUEST_RENDER_DELAY = 0.11;
+const BROADCAST_INTERVAL = 0.067; // ~15Hz cap
 const PLAYER_DEFAULT_X: Record<1 | 2, number> = {
   1: -1.15,
   2: 1.15,
@@ -380,7 +380,7 @@ export class CornholeGame {
   onSnapshot: ((snapshot: import('./net/types').Snapshot) => void) | null = null;
   onLocalIntent: ((intent: import('./net/types').Intent) => void) | null = null;
   suppressRemoteDragUntil = 0;
-  // Unified broadcast throttle: at most one snapshot send per 100ms, no matter
+  // Unified broadcast throttle: at most one snapshot send per 67ms, no matter
   // which code path asks. Multiple requests within a window collapse into a
   // single trailing send where a queued FULL request wins over FLIGHT (we'd
   // rather lose motion-smoothing samples than a real state transition).
@@ -2695,6 +2695,9 @@ export class CornholeGame {
     }
 
     this.emitState();
+    if (this.onlineHostMode && this.onSnapshot) {
+      this.requestBroadcast('full');
+    }
   }
 
   endInning() {
@@ -4045,10 +4048,17 @@ export class CornholeGame {
     if (!this.guestMode && this.onSnapshot) {
       // Skip broadcasting drag-in-progress state. The guest UI hides the
       // opponent's aim anyway, so every mousemove-driven emitState during a
-      // pull-back would just fill the 10Hz broadcast budget with invisible
+      // pull-back would just fill the 15Hz broadcast budget with invisible
       // updates, starving real transitions. The throw release still flips
       // isThrowing and clears isDragging, which broadcasts normally.
-      if (!this.state.isDragging && (!this.state.isAiming || this.state.isThrowing || this.state.isSettling || this.state.showResult || this.state.gameOver)) {
+      const shouldBroadcast =
+        !this.state.isDragging &&
+        (!this.state.isAiming ||
+          this.state.isThrowing ||
+          this.state.isSettling ||
+          this.state.showResult ||
+          this.state.gameOver);
+      if (shouldBroadcast) {
         this.requestBroadcast('full');
       }
     }
@@ -4056,7 +4066,7 @@ export class CornholeGame {
 
   // Single choke point for every network send. Any code path that wants to
   // push state to the guest queues a request here; the queue runs at most
-  // once per BROADCAST_INTERVAL (100ms = 10Hz). If multiple requests land in
+  // once per BROADCAST_INTERVAL (67ms = ~15Hz). If multiple requests land in
   // the same window they collapse: a full-state request wins over a
   // flight-only request (we'd rather drop a smoothing sample than a real
   // transition like bag-settled / round-over).
@@ -4068,9 +4078,16 @@ export class CornholeGame {
       this.onSnapshot(kind === 'flight' ? this.serializeFlightSnapshot() : this.serializeSnapshot());
       return;
     }
-    // Promote flight→full if a full is already waiting.
-    if (this.queuedBroadcast === 'full' || kind === 'full') this.queuedBroadcast = 'full';
-    else this.queuedBroadcast = 'flight';
+    if (kind === 'full') {
+      this.queuedBroadcast = 'full';
+      if (this.queuedBroadcastTimer !== null) {
+        window.clearTimeout(this.queuedBroadcastTimer);
+        this.queuedBroadcastTimer = null;
+      }
+      this.flushQueuedBroadcast();
+      return;
+    }
+    this.queuedBroadcast = 'flight';
 
     const sinceLast = this.totalTime - this.lastBroadcastAt;
 
@@ -4297,7 +4314,7 @@ export class CornholeGame {
       // Broadcast snapshots during flight/settling so the guest can see the bag move.
       // emitState only fires on state transitions — physics updates bodies every frame
       // without touching state. requestBroadcast collapses with any concurrent
-      // emitState calls, giving a single unified 10Hz send rate to the guest.
+      // emitState calls, giving a single unified 15Hz send rate to the guest.
       if (this.onSnapshot && (this.state.isThrowing || this.state.isSettling)) {
         this.requestBroadcast('flight');
       }
@@ -4305,7 +4322,7 @@ export class CornholeGame {
 
     // On the guest, blend bag meshes from the last snapshot toward the newest
     // before softness code reads them, so soft-body deformation tracks the
-    // smoothed visual rather than jumping between 10Hz snapshot positions.
+    // smoothed visual rather than jumping between 15Hz snapshot positions.
     if (this.guestMode) {
       this.stepGuestInterpolation(dt);
     }
@@ -4681,7 +4698,7 @@ export class CornholeGame {
   }
 
   // Flight-only snapshot — includes only the in-flight bag. Settled bags haven't
-  // moved so re-sending them every 100ms wastes bandwidth.
+  // moved so re-sending them every 67ms wastes bandwidth.
   serializeFlightSnapshot(): import('./net/types').Snapshot {
     return this.serializeSnapshotInternal(true);
   }
@@ -4910,7 +4927,7 @@ export class CornholeGame {
     if (!this.guestMode || this.guestBagSamples.length === 0) return;
     const now = performance.now() / 1000;
     // Ramp up render delay gradually on the first snapshot so we don't
-    // visually freeze for 160ms waiting for the buffer to fill.
+    // visually freeze for 110ms waiting for the buffer to fill.
     const sinceFirst = now - this.guestFirstSnapshotAt;
     const delay = Math.min(GUEST_RENDER_DELAY, sinceFirst);
     const renderT = now - delay;
