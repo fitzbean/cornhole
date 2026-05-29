@@ -10,7 +10,7 @@ const HOLE_RADIUS = 0.3;
 const HOLE_Z = -1.25; // hole position along board (local Z)
 // Bag center must sink BELOW this board-local Y to register as a cornhole.
 // Lower (more negative) = bag has to go deeper before it counts.
-const HOLE_CAPTURE_Y = -0.05;
+const HOLE_CAPTURE_Y = -0.10;
 const HOLE_CAPTURE_RADIUS = HOLE_RADIUS * 0.84;
 const HOLE_FUNNEL_RADIUS = HOLE_RADIUS * 0.96;
 const HOLE_VISUAL_CLEANUP_DELAY = 0.75;
@@ -98,6 +98,77 @@ const RESTITUTION = {
   BOARD: 0.0002,
   BAG_BAG: 0.001,
 } as const;
+
+// ====== BAG SOFTNESS TUNING ======
+// These control how soft / bean-bag-like the bag feels when it lands and settles.
+// Live-tunable via the on-screen debug menu (the "Bag Tuning" panel).
+export interface BagTuning {
+  restSquashMax: number;      // how much the bag flattens once settled (fraction)
+  squashExpandXZ: number;     // lateral spread driven by squash (splat outward)
+  conformMaxLift: number;     // contact-face flatten cap, × BAG_SIZE
+  impactFlattenDepth: number; // per-vertex flatten depth on impact, × bag half-height
+  deformRetain: number;       // fraction of landing deformation that persists at rest (plasticity)
+  impactDecayRate: number;    // how fast impact squash springs back (lower = softer / holds longer)
+}
+
+// "Current" = the original hand-tuned values (what the bag felt like before this pass).
+export const BAG_TUNING_CURRENT: BagTuning = {
+  restSquashMax: 0.13,
+  squashExpandXZ: 0.35,
+  conformMaxLift: 0.22,
+  impactFlattenDepth: 0.32,
+  deformRetain: 0.25,
+  impactDecayRate: 7.4,
+};
+
+// "Best" = softer bean-bag values (the menu's defaults).
+export const BAG_TUNING_BEST: BagTuning = {
+  restSquashMax: 0.28,
+  squashExpandXZ: 0.6,
+  conformMaxLift: 0.38,
+  impactFlattenDepth: 0.42,
+  deformRetain: 0.5,
+  impactDecayRate: 4.5,
+};
+
+// ====== ROLL-THROW TUNING ======
+// Controls the "Roll" throw style: a flat, low throw that lands on the front of
+// the board and tumbles forward up the slope into the hole. Live-tunable via the
+// on-screen debug menu — the landing distance / damping is the sensitive part.
+export interface RollTuning {
+  // Landing targets as absolute world Z. Player throws from z≈12; board spans z≈-8
+  // (front) to z≈-12 (back); hole is at z≈-11.2. Roll scales the landing spot with
+  // throw power, so weak throws fall short (like slide) instead of always rocketing
+  // to the board. Higher Z = shorter/weaker; lower Z = deeper toward the hole.
+  // Defaults mirror the Slide curve exactly (lerp(startZ-4, boardPos.z-1.2, power)),
+  // so roll tracks the power bar identically to slide; it just arrives flat with
+  // topspin and tumbles/rolls in rather than plopping. Tune these to bias roll
+  // shorter (land in front and roll up the slope) if you want a more distinct roll.
+  landNear: number;           // landing Z at minimum power (short, in front of the board)
+  landFar: number;            // landing Z at full power (≈ the hole, matching slide)
+  arcVyLow: number;           // launch vertical velocity at min pull (lower = flatter)
+  arcVyHigh: number;          // launch vertical velocity at full pull
+  spinLow: number;            // forward topspin (rad/s) at min power
+  spinHigh: number;           // forward topspin (rad/s) at full power
+  airAngularDamping: number;  // angular damping while tumbling in the air
+  rollLinearDamping: number;  // linear damping while rolling on the board (higher = stops sooner)
+  rollAngularDamping: number; // angular damping while rolling on the board
+  rollSpeedThreshold: number; // speed below which the bag stops "rolling" and settles flat
+}
+
+// The shipped values (my best guess — the menu's defaults / reset target).
+export const ROLL_TUNING_DEFAULT: RollTuning = {
+  landNear: 8,
+  landFar: -11.2,
+  arcVyLow: 3.0,
+  arcVyHigh: 4.6,
+  spinLow: 7,
+  spinHigh: 11,
+  airAngularDamping: 0.2,
+  rollLinearDamping: 0.3,
+  rollAngularDamping: 0.2,
+  rollSpeedThreshold: 1.2,
+};
 
 // highlight-next-line
 export type BagSide = 'sticky' | 'slick';
@@ -435,6 +506,11 @@ export class CornholeGame {
   settlingTimer = 0;
   bagSettled = false;
 
+  // Live tuning driven by the on-screen debug menu.
+  bagTuning: BagTuning = { ...BAG_TUNING_BEST };
+  rollTuning: RollTuning = { ...ROLL_TUNING_DEFAULT };
+  bagTuningMenu: HTMLDivElement | null = null;
+
   constructor(
     canvas: HTMLCanvasElement,
     onStateChange: (state: GameState) => void,
@@ -531,6 +607,8 @@ export class CornholeGame {
     this.createBagPreview();
     this.initAudio(); // Load audio files asynchronously
     this.startTurn(1);
+
+    this.createBagTuningMenu();
 
     window.addEventListener('resize', this.handleResize);
     this.installTestingHooks();
@@ -1124,7 +1202,7 @@ export class CornholeGame {
       body.velocity.set(localVel.x, localVel.y, localVel.z);
       body.angularVelocity.scale(THREE.MathUtils.clamp(1 - assist * 4 * dt, 0.68, 1), body.angularVelocity);
 
-      if (holeDist < HOLE_CAPTURE_RADIUS && localPos.y < boardTopY + BAG_SIZE * 0.34) {
+      if (holeDist < HOLE_CAPTURE_RADIUS && localPos.y < HOLE_CAPTURE_Y) {
         this.markBagInHole(i, boardWorldQuat);
       }
     }
@@ -2557,21 +2635,29 @@ export class CornholeGame {
     body.angularVelocity.set(0, 0, 0);
     const sideFlip = this.selectedBagSide === 'sticky' ? Math.PI : 0;
     const isRollThrow = this.throwStyle === 'roll';
+    // Roll releases the bag nearly flat (it tumbles end-over-end in the air);
+    // slide releases it slightly nose-down to skid in on its face.
     const releasePitch = isRollThrow
-      ? THREE.MathUtils.lerp(0.38, 0.52, speedT)
+      ? THREE.MathUtils.lerp(0.06, -0.02, speedT)
       : THREE.MathUtils.lerp(0.32, 0.12, speedT);
     const releaseYaw = isRollThrow ? this.aimX * 0.015 : 0;
-    const releaseRoll = isRollThrow ? 0.82 - this.aimX * 0.04 : -this.aimX * 0.08;
+    // No sideways bank on a roll — it must land flat and tumble straight up the board.
+    const releaseRoll = isRollThrow ? -this.aimX * 0.06 : -this.aimX * 0.08;
     body.quaternion.setFromEuler(sideFlip + releasePitch, releaseYaw, releaseRoll);
     body.material = this.selectedBagSide === 'sticky' ? this.stickyBagMaterial : this.slickBagMaterial;
     body.linearDamping = 0.4;
-    body.angularDamping = isRollThrow ? 0.82 : 0.6;
+    // Let a roll keep tumbling freely in the air; slide stabilises sooner.
+    body.angularDamping = isRollThrow ? this.rollTuning.airAngularDamping : 0.6;
 
     mesh.visible = true;
     mesh.position.set(startX, startY, startZ);
 
     const boardPos = this.boardGroup.position;
-    const targetZ = THREE.MathUtils.lerp(startZ - 4, boardPos.z - 1.2, this.pullDistance);
+    // Slide aims deep (near the hole) and skids to a stop. Roll lands short on the
+    // front of the board so its forward momentum + topspin carries it up to the hole.
+    const targetZ = isRollThrow
+      ? THREE.MathUtils.lerp(this.rollTuning.landNear, this.rollTuning.landFar, this.pullDistance)
+      : THREE.MathUtils.lerp(startZ - 4, boardPos.z - 1.2, this.pullDistance);
     const targetX = boardPos.x + this.playerX * 0.35 + this.aimX * THREE.MathUtils.lerp(1.1, 2.2, this.pullDistance);
 
     const dx = targetX - startX;
@@ -2584,10 +2670,10 @@ export class CornholeGame {
       ? THREE.MathUtils.lerp(1.02, 0.68, speedT)
       : THREE.MathUtils.lerp(1.06, 0.72, speedT));
     const arcVy = isRollThrow
-      ? THREE.MathUtils.lerp(4.7, 7.25, this.pullDistance)
+      ? THREE.MathUtils.lerp(this.rollTuning.arcVyLow, this.rollTuning.arcVyHigh, this.pullDistance)
       : THREE.MathUtils.lerp(5.6, 9.4, this.pullDistance);
     const vy = isRollThrow
-      ? THREE.MathUtils.lerp(arcVy * 0.9, arcVy * 0.42, speedT)
+      ? THREE.MathUtils.lerp(arcVy * 0.95, arcVy * 0.5, speedT)
       : THREE.MathUtils.lerp(arcVy * 1.02, arcVy * 0.38, speedT);
     const vx = dx / flightTime + this.aimX * 0.35 + (Math.random() - 0.5) * 0.18;
     const vz = dz / flightTime;
@@ -2601,12 +2687,14 @@ export class CornholeGame {
     );
 
     if (isRollThrow) {
-      const rollSpinAxis = body.quaternion.vmult(new CANNON.Vec3(0, 1, 0));
-      const rollSpinSpeed = THREE.MathUtils.lerp(10, 15, speedT);
+      // Forward topspin about the world X axis: the bag tumbles end-over-end in the
+      // direction of travel (toward -Z) so that, once it lands flat on the front of
+      // the board, the spin and momentum roll it forward up the slope into the hole.
+      const rollSpinSpeed = THREE.MathUtils.lerp(this.rollTuning.spinLow, this.rollTuning.spinHigh, speedT);
       body.angularVelocity.set(
-        rollSpinAxis.x * rollSpinSpeed + THREE.MathUtils.lerp(-0.16, 0.16, Math.random()),
-        rollSpinAxis.y * rollSpinSpeed + THREE.MathUtils.lerp(-0.1, 0.1, Math.random()),
-        rollSpinAxis.z * rollSpinSpeed + THREE.MathUtils.lerp(-0.16, 0.16, Math.random())
+        -rollSpinSpeed + THREE.MathUtils.lerp(-0.3, 0.3, Math.random()),
+        this.aimX * 0.5 + THREE.MathUtils.lerp(-0.12, 0.12, Math.random()),
+        THREE.MathUtils.lerp(-0.18, 0.18, Math.random())
       );
     } else {
       body.angularVelocity.set(
@@ -2628,21 +2716,13 @@ export class CornholeGame {
     // Get bag world position
     const bagPos = new THREE.Vector3(body.position.x, body.position.y, body.position.z);
 
-    // Transform to board local space
+    // Transform to board local space so hole gating matches the capture detector.
     const boardWorldPos = new THREE.Vector3();
     this.boardGroup.getWorldPosition(boardWorldPos);
-
-    // Simple: check distance from hole in world space
-    const holeWorldPos = new THREE.Vector3(
-      boardWorldPos.x,
-      boardWorldPos.y + 0.1,
-      boardWorldPos.z + HOLE_Z * Math.cos(this.boardGroup.rotation.x)
-    );
-
-    const holeDist = Math.sqrt(
-      (bagPos.x - holeWorldPos.x) ** 2 +
-      (bagPos.z - holeWorldPos.z) ** 2
-    );
+    const boardWorldQuat = new THREE.Quaternion();
+    this.boardGroup.getWorldQuaternion(boardWorldQuat);
+    const bagLocal = bagPos.clone().sub(boardWorldPos).applyQuaternion(boardWorldQuat.clone().invert());
+    const holeLocalDist = Math.hypot(bagLocal.x, bagLocal.z - HOLE_Z);
 
     // Check if bag is on board
     const boardHalfW = BOARD_W / 2 + 0.1;
@@ -2653,7 +2733,8 @@ export class CornholeGame {
 
     let result = '';
 
-    if (holeDist < HOLE_RADIUS - 0.05 && bagPos.y < boardWorldPos.y + 0.2) {
+    if (this.bagInHole[bagIndex]
+        || (holeLocalDist < HOLE_CAPTURE_RADIUS && bagLocal.y < HOLE_CAPTURE_Y)) {
       result = '🎯 IN THE HOLE!';
     } else if (onBoardX && onBoardZ && onBoardY) {
       result = '✅ On the board!';
@@ -2814,11 +2895,10 @@ export class CornholeGame {
     const bagPos = new THREE.Vector3(body.position.x, body.position.y, body.position.z);
     const boardWorldPos = new THREE.Vector3();
     this.boardGroup.getWorldPosition(boardWorldPos);
-    const holeWorldPos = this.getHoleWorldPosition();
-    const holeDist = Math.sqrt(
-      (bagPos.x - holeWorldPos.x) ** 2 +
-      (bagPos.z - holeWorldPos.z) ** 2
-    );
+    const boardWorldQuat = new THREE.Quaternion();
+    this.boardGroup.getWorldQuaternion(boardWorldQuat);
+    const bagLocal = bagPos.clone().sub(boardWorldPos).applyQuaternion(boardWorldQuat.clone().invert());
+    const holeLocalDist = Math.hypot(bagLocal.x, bagLocal.z - HOLE_Z);
     const boardHalfW = BOARD_W / 2 + 0.1;
     const boardHalfL = BOARD_L / 2 + 0.1;
     const onBoardX = Math.abs(bagPos.x - boardWorldPos.x) < boardHalfW;
@@ -2826,7 +2906,7 @@ export class CornholeGame {
     const onBoardY = bagPos.y > boardWorldPos.y - 0.3 && bagPos.y < boardWorldPos.y + 1.0;
 
     if (this.bagInHole[index]) return 3;
-    if (holeDist < HOLE_RADIUS - 0.05 && bagPos.y < boardWorldPos.y + 0.2) return 3;
+    if (holeLocalDist < HOLE_CAPTURE_RADIUS && bagLocal.y < HOLE_CAPTURE_Y) return 3;
     if (onBoardX && onBoardZ && onBoardY) return 1;
     return 0;
   }
@@ -2973,13 +3053,22 @@ export class CornholeGame {
     // tumbles on impact, and vice versa.
     const thrownSide = this.bagSides[bagIndex];
     const isSticky = thrownSide === 'sticky';
+    // A roll bag that still has forward speed is mid-roll up the board. Keep its
+    // damping low so the tumble + momentum carry it, and (below) don't fight the
+    // tilt with the anti-edge torque until it has slowed to a near stop.
+    const activelyRolling = this.bagThrowStyles[bagIndex] === 'roll' && horizontalSpeed > this.rollTuning.rollSpeedThreshold;
 
     body.material = isSticky ? this.stickyBagMaterial : this.slickBagMaterial;
-    body.linearDamping = isSticky
-      ? THREE.MathUtils.lerp(0.5, 0.68, Math.min(1, horizontalSpeed / 5))
-      : THREE.MathUtils.lerp(0.08, 0.18, Math.min(1, horizontalSpeed / 6));
-    body.linearDamping *= surfaceDampingMultiplier;
-    body.angularDamping = isSticky ? 0.72 : 0.34;
+    if (activelyRolling) {
+      body.linearDamping = this.rollTuning.rollLinearDamping * surfaceDampingMultiplier;
+      body.angularDamping = this.rollTuning.rollAngularDamping;
+    } else {
+      body.linearDamping = isSticky
+        ? THREE.MathUtils.lerp(0.5, 0.68, Math.min(1, horizontalSpeed / 5))
+        : THREE.MathUtils.lerp(0.08, 0.18, Math.min(1, horizontalSpeed / 6));
+      body.linearDamping *= surfaceDampingMultiplier;
+      body.angularDamping = isSticky ? 0.72 : 0.34;
+    }
 
     // Prevent bag from standing on its side. A real bean bag is a loose sack of
     // corn — its center of mass shifts the moment it tilts, so it physically cannot
@@ -2993,7 +3082,7 @@ export class CornholeGame {
     // Engage whenever the bag is meaningfully off-flat (within ~25° of flat is fine).
     // tiltFactor goes 0→1 as |upDotY| drops from 0.9 (flat-ish) to 0 (on edge).
     const tiltFactor = THREE.MathUtils.clamp((0.9 - upDotY) / 0.9, 0, 1);
-    if (tiltFactor > 0) {
+    if (tiltFactor > 0 && !activelyRolling) {
       // Don't fight large existing spin, but don't require near-zero either — a
       // bag slowly toppling should keep getting a nudge.
       const angularSpeed = body.angularVelocity.length();
@@ -3127,14 +3216,14 @@ export class CornholeGame {
         : 0;
     const holeInfluence = Math.max(holeRingInfluence * 1.15, holeCenterInfluence * 0.95);
     const restSquashTarget = surfaceContact
-      ? THREE.MathUtils.lerp(0.02, 0.13, settleAmount) + slideAmount * 0.05 + holeInfluence * 0.1
+      ? THREE.MathUtils.lerp(0.02, this.bagTuning.restSquashMax, settleAmount) + slideAmount * 0.05 + holeInfluence * 0.1
       : 0;
 
-    visual.impactSquash = THREE.MathUtils.damp(visual.impactSquash, 0, surfaceContact ? 7.4 : 4.4, dt);
+    visual.impactSquash = THREE.MathUtils.damp(visual.impactSquash, 0, surfaceContact ? this.bagTuning.impactDecayRate : 4.4, dt);
     visual.squash = THREE.MathUtils.damp(visual.squash, Math.max(restSquashTarget, visual.impactSquash), surfaceContact ? 10.5 : 5.3, dt);
     visual.wobbleAmplitude = THREE.MathUtils.damp(visual.wobbleAmplitude, 0, surfaceContact ? 2.25 : 1.15, dt);
     visual.wobbleTime += dt * (5.8 + horizontalSpeed * 1.15 + holeInfluence * 3.3);
-    visual.deformAmount = THREE.MathUtils.damp(visual.deformAmount, surfaceContact ? settleAmount * 0.25 : 0, surfaceContact ? 3.5 : 6.0, dt);
+    visual.deformAmount = THREE.MathUtils.damp(visual.deformAmount, surfaceContact ? settleAmount * this.bagTuning.deformRetain : 0, surfaceContact ? 3.5 : 6.0, dt);
 
     // --- Fill shifting: corn settles toward gravity-relative low point (only when on surface) ---
     const sloshing = visual.impactSquash > 0.02;
@@ -3232,7 +3321,7 @@ export class CornholeGame {
         const t = THREE.MathUtils.clamp((contactAxis + 0.15) * 0.6, 0, 1);
         const contactProximity = t * t * (3 - 2 * t); // smoothstep
         // Flatten contact-side vertices toward a plane
-        const flattenY = -contactSide * contactProximity * visual.deformAmount * bagHalfH * 0.32;
+        const flattenY = -contactSide * contactProximity * visual.deformAmount * bagHalfH * this.bagTuning.impactFlattenDepth;
         // Bulge opposite side (volume conservation) with smoothstep falloff.
         const ot = THREE.MathUtils.clamp((-contactAxis + 0.15) * 0.6, 0, 1);
         const oppositeProximity = ot * ot * (3 - 2 * ot);
@@ -3251,7 +3340,7 @@ export class CornholeGame {
       if (visual.squash > 0.001) {
         // Compress Y, expand XZ (like the old scale but per-vertex)
         const squashY = -ry * visual.squash * 0.7;
-        const expandXZ = visual.squash * 0.35;
+        const expandXZ = visual.squash * this.bagTuning.squashExpandXZ;
         ry += squashY;
         rx *= 1 + expandXZ * (1 - Math.abs(yNorm) * 0.3);
         rz *= 1 + expandXZ * (1 - Math.abs(yNorm) * 0.3);
@@ -3348,7 +3437,7 @@ export class CornholeGame {
             // about a quarter of its thickness — anything beyond that would be a
             // stretch artefact (e.g. a vertex hanging off the board edge being yanked
             // up to meet the board top). Clamping keeps the mesh coherent.
-            const maxLift = BAG_SIZE * 0.22;
+            const maxLift = BAG_SIZE * this.bagTuning.conformMaxLift;
             worldDy += Math.min(penetration, maxLift) * conformWeight;
           }
           // Keep a tiny sliver above the surface on near-plane vertices so the
@@ -3388,7 +3477,8 @@ export class CornholeGame {
     }
 
     const body = this.bagBodies[index];
-    body.collisionResponse = false;
+    // Don't disable collision yet - let the bag continue to collide with the back of the board
+    // until it's actually through the hole and below the board surface
 
     const quat = boardWorldQuat ?? (() => {
       const q = new THREE.Quaternion();
@@ -3866,6 +3956,12 @@ export class CornholeGame {
 
 // highlight-next-line
   handleKeyDown = (event: KeyboardEvent) => {
+    // Debug: toggle the bag-softness tuning panel (only exists when debug-enabled).
+    if (event.code === 'Backquote' && !event.repeat && this.bagTuningMenu) {
+      this.toggleBagTuningMenu();
+      event.preventDefault();
+      return;
+    }
     if (this.guestMode) {
       if (this.matches('moveLeft', event.code)) {
         this.onLocalIntent?.({ type: 'moveStart', direction: 'left' });
@@ -4441,8 +4537,202 @@ export class CornholeGame {
     }
   }
 
+  // Debug-only: the bag-softness panel is built only when enabled (Vite dev mode,
+  // or any build with a `?tuning` / `?debug` URL param) and is hidden until the
+  // backtick (`) key toggles it. It never ships to regular players.
+  isBagTuningDebugEnabled(): boolean {
+    try {
+      if (import.meta.env?.DEV) return true;
+      const params = new URLSearchParams(window.location.search);
+      return params.has('tuning') || params.has('debug');
+    } catch {
+      return false;
+    }
+  }
+
+  toggleBagTuningMenu() {
+    if (!this.bagTuningMenu) return;
+    const hidden = this.bagTuningMenu.style.display === 'none';
+    this.bagTuningMenu.style.display = hidden ? 'block' : 'none';
+  }
+
+  createBagTuningMenu() {
+    if (typeof document === 'undefined') return;
+    if (!this.isBagTuningDebugEnabled()) return;
+
+    const panel = document.createElement('div');
+    panel.style.cssText = [
+      'position:fixed', 'top:12px', 'right:12px', 'z-index:10000',
+      'width:280px', 'max-height:88vh', 'overflow-y:auto', 'padding:12px', 'border-radius:10px',
+      'background:rgba(18,20,26,0.92)', 'color:#e8eaf0',
+      'font:12px/1.4 system-ui,sans-serif', 'box-shadow:0 6px 24px rgba(0,0,0,0.45)',
+      'backdrop-filter:blur(6px)', 'user-select:none',
+    ].join(';');
+
+    // Header (click to collapse/expand)
+    const header = document.createElement('div');
+    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;cursor:pointer;font-weight:600;margin-bottom:4px';
+    const title = document.createElement('span');
+    title.textContent = '🎯 Tuning';
+    const caret = document.createElement('span');
+    caret.textContent = '▾';
+    caret.style.opacity = '0.7';
+    header.append(title, caret);
+
+    const body = document.createElement('div');
+
+    const makeBtn = (text: string, onClick: () => void) => {
+      const b = document.createElement('button');
+      b.textContent = text;
+      b.style.cssText = [
+        'flex:1', 'padding:6px 4px', 'border:none', 'border-radius:6px',
+        'background:#2c3440', 'color:#e8eaf0', 'font:11px/1 system-ui,sans-serif',
+        'cursor:pointer',
+      ].join(';');
+      b.addEventListener('mouseenter', () => { b.style.background = '#3a4452'; });
+      b.addEventListener('mouseleave', () => { b.style.background = '#2c3440'; });
+      b.addEventListener('click', onClick);
+      return b;
+    };
+
+    type Field = { key: string; label: string; min: number; max: number; step: number };
+    const buildSection = (
+      sectionTitle: string,
+      target: Record<string, number>,
+      fields: Field[],
+      presets: { label: string; values: Record<string, number> }[],
+    ) => {
+      const section = document.createElement('div');
+
+      const h = document.createElement('div');
+      h.textContent = sectionTitle;
+      h.style.cssText = 'font-weight:600;margin:12px 0 8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.12)';
+      section.append(h);
+
+      const inputs = new Map<string, HTMLInputElement>();
+      const readouts = new Map<string, HTMLSpanElement>();
+
+      for (const f of fields) {
+        const row = document.createElement('div');
+        row.style.cssText = 'margin-bottom:10px';
+
+        const labelRow = document.createElement('div');
+        labelRow.style.cssText = 'display:flex;justify-content:space-between;margin-bottom:3px';
+        const label = document.createElement('span');
+        label.textContent = f.label;
+        label.style.cssText = 'opacity:0.85';
+        const readout = document.createElement('span');
+        readout.style.cssText = 'font-variant-numeric:tabular-nums;color:#8fd0ff;font-weight:600';
+        labelRow.append(label, readout);
+
+        const slider = document.createElement('input');
+        slider.type = 'range';
+        slider.min = String(f.min);
+        slider.max = String(f.max);
+        slider.step = String(f.step);
+        slider.style.cssText = 'width:100%;accent-color:#5aa9e6;cursor:pointer';
+        slider.addEventListener('input', () => {
+          const v = parseFloat(slider.value);
+          target[f.key] = v;
+          readout.textContent = v.toFixed(2);
+        });
+
+        row.append(labelRow, slider);
+        section.append(row);
+        inputs.set(f.key, slider);
+        readouts.set(f.key, readout);
+      }
+
+      const refresh = () => {
+        for (const f of fields) {
+          const v = target[f.key];
+          inputs.get(f.key)!.value = String(v);
+          readouts.get(f.key)!.textContent = v.toFixed(2);
+        }
+      };
+
+      const btnRow = document.createElement('div');
+      btnRow.style.cssText = 'display:flex;gap:6px;margin-top:4px';
+      for (const preset of presets) {
+        btnRow.append(makeBtn(`Reset to ${preset.label}`, () => {
+          Object.assign(target, preset.values);
+          refresh();
+        }));
+      }
+      section.append(btnRow);
+
+      const copyBtn = makeBtn('Copy values', () => {
+        const json = JSON.stringify(target, null, 2);
+        navigator.clipboard?.writeText(json).then(
+          () => { copyBtn.textContent = 'Copied! ✓'; window.setTimeout(() => { copyBtn.textContent = 'Copy values'; }, 1200); },
+          () => { copyBtn.textContent = 'Copy failed'; window.setTimeout(() => { copyBtn.textContent = 'Copy values'; }, 1200); },
+        );
+      });
+      copyBtn.style.marginTop = '6px';
+      copyBtn.style.background = '#1f3a2c';
+      section.append(copyBtn);
+
+      refresh();
+      return section;
+    };
+
+    body.append(
+      buildSection(
+        '🛋️ Bag Softness',
+        this.bagTuning as unknown as Record<string, number>,
+        [
+          { key: 'restSquashMax', label: 'Rest squash (flatten when settled)', min: 0, max: 0.6, step: 0.01 },
+          { key: 'squashExpandXZ', label: 'Spread (splat outward)', min: 0, max: 1.2, step: 0.01 },
+          { key: 'conformMaxLift', label: 'Conform flatten cap', min: 0, max: 0.6, step: 0.01 },
+          { key: 'impactFlattenDepth', label: 'Impact flatten depth', min: 0, max: 0.8, step: 0.01 },
+          { key: 'deformRetain', label: 'Plasticity (holds its shape)', min: 0, max: 1, step: 0.01 },
+          { key: 'impactDecayRate', label: 'Spring-back speed (lower = softer)', min: 1, max: 12, step: 0.1 },
+        ],
+        [
+          { label: 'Current', values: BAG_TUNING_CURRENT as unknown as Record<string, number> },
+          { label: 'Best', values: BAG_TUNING_BEST as unknown as Record<string, number> },
+        ],
+      ),
+      buildSection(
+        '🎳 Roll Throw',
+        this.rollTuning as unknown as Record<string, number>,
+        [
+          { key: 'landNear', label: 'Landing Z — low power (higher = shorter)', min: -2, max: 12, step: 0.2 },
+          { key: 'landFar', label: 'Landing Z — full power (lower = deeper)', min: -12, max: -6, step: 0.1 },
+          { key: 'arcVyLow', label: 'Arc height — low power (lower = flatter)', min: 1.5, max: 6, step: 0.1 },
+          { key: 'arcVyHigh', label: 'Arc height — full power', min: 2.5, max: 8, step: 0.1 },
+          { key: 'spinLow', label: 'Topspin — low power', min: 0, max: 20, step: 0.5 },
+          { key: 'spinHigh', label: 'Topspin — full power', min: 0, max: 25, step: 0.5 },
+          { key: 'airAngularDamping', label: 'Air tumble damping', min: 0, max: 1, step: 0.02 },
+          { key: 'rollLinearDamping', label: 'Roll friction (higher = stops sooner)', min: 0, max: 1.5, step: 0.02 },
+          { key: 'rollAngularDamping', label: 'Roll spin damping', min: 0, max: 1, step: 0.02 },
+          { key: 'rollSpeedThreshold', label: 'Settle-flat threshold', min: 0, max: 5, step: 0.1 },
+        ],
+        [
+          { label: 'Default', values: ROLL_TUNING_DEFAULT as unknown as Record<string, number> },
+        ],
+      ),
+    );
+
+    // Collapse toggle
+    let collapsed = false;
+    header.addEventListener('click', () => {
+      collapsed = !collapsed;
+      body.style.display = collapsed ? 'none' : 'block';
+      caret.textContent = collapsed ? '▸' : '▾';
+    });
+
+    panel.append(header, body);
+    panel.style.display = 'none'; // hidden until toggled with the backtick (`) key
+    document.body.appendChild(panel);
+    this.bagTuningMenu = panel;
+    console.info('[Tuning] debug panel available — press ` (backtick) to toggle.');
+  }
+
   dispose() {
     this.isDisposed = true;
+    this.bagTuningMenu?.remove();
+    this.bagTuningMenu = null;
     if (this.animationFrameId !== null) {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = null;
@@ -4494,6 +4784,7 @@ export class CornholeGame {
     canvas.addEventListener('mouseup', this.handleMouseUp);
     canvas.addEventListener('mouseleave', this.handleMouseLeave);
     canvas.addEventListener('wheel', this.handleWheel, { passive: false });
+    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   }
 
   // ====== MULTIPLAYER ======
