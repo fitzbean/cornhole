@@ -170,6 +170,101 @@ export const ROLL_TUNING_DEFAULT: RollTuning = {
   rollSpeedThreshold: 1.2,
 };
 
+// ====== BAG LOOK TUNING (in-flight floppiness) ======
+// Purely visual: a real cornhole bag is a floppy sack that flexes in the air —
+// the rim droops under gravity, the leading edge curls up against the airflow,
+// flat spin bulges it outward, and the free edges flutter. None of this touches
+// the physics body; it deforms the render mesh only. All amplitudes multiply
+// by flightFlex, so 0 reproduces the pre-flex look exactly.
+export interface BagLookTuning {
+  flightFlex: number;   // master 0–1: overall in-flight softness
+  aeroCurl: number;     // leading-edge lift / trailing-edge sag, × bag half-height
+  rimDroop: number;     // gravity droop of the rim relative to the center, × bag half-height
+  spinBulge: number;    // centrifugal radial bulge at full flat spin (fraction of XZ)
+  flutterAmp: number;   // edge flutter amplitude, × bag half-height
+  flutterSpeed: number; // flutter oscillation speed (rad/s-ish)
+}
+
+export const BAG_LOOK_OFF: BagLookTuning = {
+  flightFlex: 0,
+  aeroCurl: 0,
+  rimDroop: 0,
+  spinBulge: 0,
+  flutterAmp: 0,
+  flutterSpeed: 9,
+};
+
+export const BAG_LOOK_DEFAULT: BagLookTuning = {
+  flightFlex: 1,
+  aeroCurl: 0.34,
+  rimDroop: 0.42,
+  spinBulge: 0.07,
+  flutterAmp: 0.07,
+  flutterSpeed: 9,
+};
+
+// ====== PHYSICS FEEL TUNING (dead-bag landing behavior) ======
+// A real cornhole bag is a dead sack: it cannot store elastic energy, so the
+// landing is a mushy thwap (no impulsive pop) and a corner-first hit cannot
+// launch it into a flip the way a rigid box does. Two mechanisms:
+//   1. Contact softening — lower contactEquationStiffness / higher relaxation
+//      on the bag contact materials spreads the collision impulse over a few
+//      frames instead of one hard pop. (Cannon defaults: 1e7 / 3.)
+//   2. Dead-mass impact correction — a post-step pass (applyDeadBagImpacts)
+//      that, on hard surface impacts, bleeds off tumble (X/Z spin) and caps
+//      the rebound. Y flat-spin is preserved so the slide throw's skid
+//      rotation is untouched, and actively-rolling roll bags are exempt.
+// The CURRENT preset is bit-identical to the pre-change behavior.
+export interface PhysicsFeelTuning {
+  contactStiffnessExp: number; // bag↔board/ground stiffness = 10^x (7.0 = engine default)
+  contactRelaxation: number;   // bag↔board/ground relaxation frames (3 = engine default)
+  bagBagStiffnessExp: number;  // bag↔bag stiffness = 10^x
+  bagBagRelaxation: number;    // bag↔bag relaxation frames
+  tumbleKill: number;          // fraction of X/Z spin removed on a hard surface impact (0 = off)
+  bounceCapUp: number;         // cap on upward velocity right after a hard impact, m/s (99 = off)
+  impactSeverityMin: number;   // velocity change (m/s) that counts as a hard impact (99 = off)
+  // Bag-on-bag: dead-sack shoves and stacking.
+  bagBagAngularKill: number;   // spin removed from both bags on a bag-bag hit (0 = off)
+  strikerEnergyLoss: number;   // striker's speed bled per contact frame (corn absorbs the blow)
+  stackTipRelief: number;      // how much the anti-edge tipping torque relaxes for a bag resting on another bag
+  stackSettleDamping: number;  // extra damping for a slow bag sitting on another bag (0 = off)
+}
+
+export const PHYSICS_FEEL_CURRENT: PhysicsFeelTuning = {
+  contactStiffnessExp: 7.0,
+  contactRelaxation: 3,
+  bagBagStiffnessExp: 7.0,
+  bagBagRelaxation: 3,
+  tumbleKill: 0,
+  bounceCapUp: 99,
+  impactSeverityMin: 99,
+  bagBagAngularKill: 0,
+  strikerEnergyLoss: 0,
+  stackTipRelief: 0,
+  stackSettleDamping: 0,
+};
+
+// Measured on the 300-throw regression suite: bag↔board contact softening
+// below ~10^6.8 destabilizes the roll throw's corner-over-corner tumble
+// (it lost its hole captures at 10^6.5), while the dead-mass pass alone
+// already sells the thwap for slide bags — so surface stiffness stays at
+// the engine default and the feel comes from tumbleKill + bounceCap.
+// Bag↔bag softening only affects multi-bag contacts (blocker shoves) and is
+// kept — single-bag outcomes are insensitive to it.
+export const PHYSICS_FEEL_BEST: PhysicsFeelTuning = {
+  contactStiffnessExp: 7.0,
+  contactRelaxation: 3,
+  bagBagStiffnessExp: 6.2,
+  bagBagRelaxation: 4,
+  tumbleKill: 0.6,
+  bounceCapUp: 0.25,
+  impactSeverityMin: 1.5,
+  bagBagAngularKill: 0.5,
+  strikerEnergyLoss: 0.18,
+  stackTipRelief: 0.55,
+  stackSettleDamping: 0.85,
+};
+
 // highlight-next-line
 export type BagSide = 'sticky' | 'slick';
 export type ThrowStyle = 'slide' | 'roll';
@@ -220,6 +315,8 @@ interface BagVisualState {
   fillOffsetX: number;
   fillOffsetY: number;
   fillOffsetZ: number;
+  // In-flight floppiness blend (0 = rigid/landed, 1 = fully airborne flex)
+  airFlex: number;
   // Deformation tracking
   isDeforming: boolean;
   prevSettled: boolean;
@@ -229,7 +326,39 @@ declare global {
   interface Window {
     render_game_to_text?: () => string;
     advanceTime?: (ms: number) => void;
+    testSetup?: () => void;
+    testThrow?: (opts: {
+      pull: number;
+      aimX?: number;
+      style?: ThrowStyle;
+      side?: BagSide;
+      seed?: number;
+    }) => boolean;
+    testSnapshot?: () => {
+      bags: Array<{
+        index: number;
+        visible: boolean;
+        inHole: boolean;
+        x: number; y: number; z: number;
+        qx: number; qy: number; qz: number; qw: number;
+      }>;
+      player1RoundScore: number;
+      player2RoundScore: number;
+      settled: boolean;
+    };
+    testResetBags?: () => void;
   }
+}
+
+// Deterministic PRNG for the scripted throw suite (window.testThrow).
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
 export interface GameState {
@@ -349,6 +478,14 @@ export class CornholeGame {
   bagVisualLocalPos = new THREE.Vector3();
   bagVisualEuler = new THREE.Euler();
   bagVisualQuat = new THREE.Quaternion();
+  // Scratch objects for the per-vertex deform loop (hoisted — the loop runs
+  // ~460 times per deforming bag per frame; allocating there churns the GC).
+  private bagDeformQuatInv = new THREE.Quaternion();
+  private bagDeformWorldVert = new THREE.Vector3();
+  private bagDeformBoardLocal = new THREE.Vector3();
+  private bagDeformSurfacePoint = new THREE.Vector3();
+  private bagDeformWorldDelta = new THREE.Vector3();
+  private bagDeformLocalVel = new THREE.Vector3();
 
   // State
   state: GameState = {
@@ -471,6 +608,19 @@ export class CornholeGame {
     quat: THREE.Quaternion;
   }[][] = [];
   private guestFirstSnapshotAt = 0;
+  // Guest-side velocity estimation. The guest never steps the physics world,
+  // so bag bodies have no real velocity — but applyBagVisualSoftness keys all
+  // impact/wobble/slosh effects off body.velocity. We reconstruct a smoothed
+  // velocity (and angular velocity) from the interpolated mesh motion each
+  // frame and write it onto the body. Host is untouched (real sim velocity).
+  private guestBagPrevPos: THREE.Vector3[] = [];
+  private guestBagPrevQuat: THREE.Quaternion[] = [];
+  private guestBagVel: THREE.Vector3[] = [];
+  private guestBagAngVel: THREE.Vector3[] = [];
+  private guestBagVelInit: boolean[] = [];
+  private guestVelPrevNow = 0;
+  private guestVelScratchQuat = new THREE.Quaternion();
+  private guestVelScratchQuatInv = new THREE.Quaternion();
 
   // Callbacks
   onStateChange: (state: GameState) => void;
@@ -509,6 +659,25 @@ export class CornholeGame {
   // Live tuning driven by the on-screen debug menu.
   bagTuning: BagTuning = { ...BAG_TUNING_BEST };
   rollTuning: RollTuning = { ...ROLL_TUNING_DEFAULT };
+  // Shipped dormant: the in-flight flex and dead-bag/bag-on-bag feel changes
+  // are OFF by default (neutral presets reproduce the pre-change behavior
+  // exactly). They remain live-tunable via the debug menu (backtick / ?tuning)
+  // for future evaluation. The guest-deformation velocity estimator is
+  // separate code and stays active regardless — it's a bug fix, not a feel knob.
+  bagLook: BagLookTuning = { ...BAG_LOOK_OFF };
+  physicsFeel: PhysicsFeelTuning = { ...PHYSICS_FEEL_CURRENT };
+  // Contact materials kept for live tuning (stiffness/relaxation sliders).
+  private bagSurfaceContactMaterials: CANNON.ContactMaterial[] = [];
+  private bagBagContactMaterials: CANNON.ContactMaterial[] = [];
+  // Pre-world.step bag velocities, for impact-severity measurement.
+  private bagPreStepVelocities: CANNON.Vec3[] = [];
+  // Per-frame contact classification (host only, filled by classifyBagContacts).
+  private bagTouchSurface: boolean[] = Array(8).fill(false);
+  private bagTouchBag: boolean[] = Array(8).fill(false);
+  private bagSurfaceNormals: CANNON.Vec3[] = [];
+  // Source of randomness for throw wobble/jitter. Defaults to Math.random;
+  // the test harness swaps in a seeded PRNG so scripted throws are deterministic.
+  throwRandom: () => number = Math.random;
   bagTuningMenu: HTMLDivElement | null = null;
 
   constructor(
@@ -575,7 +744,9 @@ export class CornholeGame {
     ] as const;
 
     const addContact = (a: CANNON.Material, b: CANNON.Material, friction: number, restitution: number) => {
-      this.world.addContactMaterial(new CANNON.ContactMaterial(a, b, { friction, restitution }));
+      const contact = new CANNON.ContactMaterial(a, b, { friction, restitution });
+      this.world.addContactMaterial(contact);
+      return contact;
     };
 
     // Bag vs surface
@@ -583,7 +754,7 @@ export class CornholeGame {
       for (const surface of surfaceMats) {
         const friction = (FRICTION as Record<string, number>)[`${bag.key}_${surface.key}`];
         const restitution = 'restitution' in surface ? surface.restitution : surface.restitutionFor(bag.key);
-        addContact(bag.mat, surface.mat, friction, restitution);
+        this.bagSurfaceContactMaterials.push(addContact(bag.mat, surface.mat, friction, restitution));
       }
     }
 
@@ -594,9 +765,10 @@ export class CornholeGame {
         const a = bagMats[i];
         const b = bagMats[j];
         const friction = frictionTable[`${a.key}_${b.key}`] ?? frictionTable[`${b.key}_${a.key}`];
-        addContact(a.mat, b.mat, friction, RESTITUTION.BAG_BAG);
+        this.bagBagContactMaterials.push(addContact(a.mat, b.mat, friction, RESTITUTION.BAG_BAG));
       }
     }
+    this.applyPhysicsFeelContacts();
 
     this.createLights();
     this.createGround(groundMat);
@@ -1208,6 +1380,174 @@ export class CornholeGame {
     }
   }
 
+  // Push the live physics-feel tuning into the stored contact materials.
+  // Called once at setup and again every step so the debug sliders apply
+  // instantly (24 float assignments — negligible).
+  applyPhysicsFeelContacts() {
+    const surfaceStiffness = Math.pow(10, this.physicsFeel.contactStiffnessExp);
+    const bagBagStiffness = Math.pow(10, this.physicsFeel.bagBagStiffnessExp);
+    for (const mat of this.bagSurfaceContactMaterials) {
+      mat.contactEquationStiffness = surfaceStiffness;
+      mat.contactEquationRelaxation = this.physicsFeel.contactRelaxation;
+    }
+    for (const mat of this.bagBagContactMaterials) {
+      mat.contactEquationStiffness = bagBagStiffness;
+      mat.contactEquationRelaxation = this.physicsFeel.bagBagRelaxation;
+    }
+  }
+
+  // Record every bag's velocity just before world.step so applyDeadBagImpacts
+  // can measure how violently the solver changed it (impact severity).
+  snapshotBagVelocities() {
+    if (this.bagPreStepVelocities.length !== this.bagBodies.length) {
+      this.bagPreStepVelocities = this.bagBodies.map(() => new CANNON.Vec3());
+    }
+    for (let i = 0; i < this.bagBodies.length; i++) {
+      this.bagPreStepVelocities[i].copy(this.bagBodies[i].velocity);
+    }
+  }
+
+  // One sweep over this frame's contacts: which bags touch the board/ground
+  // (and with what surface normal), and which touch another bag. Consumed by
+  // applyDeadBagImpacts, applyBagBagImpacts and updateBagSurfacePhysics.
+  classifyBagContacts() {
+    if (this.bagSurfaceNormals.length !== this.bagBodies.length) {
+      this.bagSurfaceNormals = this.bagBodies.map(() => new CANNON.Vec3(0, 1, 0));
+    }
+    for (let i = 0; i < this.bagBodies.length; i++) {
+      this.bagTouchSurface[i] = false;
+      this.bagTouchBag[i] = false;
+      this.bagSurfaceNormals[i].set(0, 1, 0);
+    }
+    for (const contact of this.world.contacts) {
+      const bi = this.bagBodies.indexOf(contact.bi);
+      const bj = this.bagBodies.indexOf(contact.bj);
+      if (bi < 0 && bj < 0) continue;
+      if (bi >= 0 && bj >= 0) {
+        this.bagTouchBag[bi] = true;
+        this.bagTouchBag[bj] = true;
+        continue;
+      }
+      const bagIdx = bi >= 0 ? bi : bj;
+      // Keep the FIRST surface contact's normal for each bag (multiple
+      // contacts can exist, e.g. board top + front edge).
+      if (!this.bagTouchSurface[bagIdx]) {
+        this.bagTouchSurface[bagIdx] = true;
+        // contact.ni points from bi to bj — orient it surface → bag.
+        const sign = bj >= 0 ? 1 : -1;
+        this.bagSurfaceNormals[bagIdx].set(contact.ni.x * sign, contact.ni.y * sign, contact.ni.z * sign);
+      }
+    }
+  }
+
+  // Dead-sack bag-on-bag response. Real bags shove each other like sacks of
+  // pellets: the struck bag takes the momentum, neither bag spins away, and
+  // the striker loses energy into the soft collision. The solver already gets
+  // the impulse direction right (restitution ~0) — we only remove energy,
+  // never redirect it. Neutral preset values (0) make this a no-op.
+  applyBagBagImpacts() {
+    const feel = this.physicsFeel;
+    if (feel.bagBagAngularKill <= 0.001 && feel.strikerEnergyLoss <= 0.001) return;
+
+    let processed: Set<number> | null = null;
+    for (const contact of this.world.contacts) {
+      const bi = this.bagBodies.indexOf(contact.bi);
+      const bj = this.bagBodies.indexOf(contact.bj);
+      if (bi < 0 || bj < 0) continue;
+      if (this.bagInHole[bi] || this.bagInHole[bj]) continue;
+      // Hidden bodies park interpenetrating at y=-20 between throws; the
+      // solver pops them apart at speed. Leave that pile alone or it changes
+      // solver state for live bags.
+      if (!this.bags[bi]?.visible || !this.bags[bj]?.visible) continue;
+      const key = bi < bj ? bi * 8 + bj : bj * 8 + bi;
+      if (!processed) processed = new Set();
+      if (processed.has(key)) continue;
+      processed.add(key);
+
+      const a = this.bagBodies[bi];
+      const b = this.bagBodies[bj];
+      const rvx = a.velocity.x - b.velocity.x;
+      const rvy = a.velocity.y - b.velocity.y;
+      const rvz = a.velocity.z - b.velocity.z;
+      const relSpeed = Math.sqrt(rvx * rvx + rvy * rvy + rvz * rvz);
+      // Resting/settled contact — leave it to the solver.
+      if (relSpeed < 0.8) continue;
+
+      const factor = THREE.MathUtils.clamp(relSpeed / 6, 0, 1);
+      const angKill = 1 - feel.bagBagAngularKill * factor;
+      if (angKill < 0.999) {
+        a.angularVelocity.scale(angKill, a.angularVelocity);
+        b.angularVelocity.scale(angKill, b.angularVelocity);
+      }
+      // The faster bag is the striker; it bleeds speed into the soft hit.
+      // The struck bag keeps its solver-given velocity (momentum-true push).
+      const striker = a.velocity.lengthSquared() >= b.velocity.lengthSquared() ? a : b;
+      striker.velocity.scale(1 - feel.strikerEnergyLoss * factor, striker.velocity);
+    }
+  }
+
+  // Dead-mass impact correction. A real cornhole bag is a floppy sack of
+  // pellets: it cannot store elastic energy, so a hard landing kills its
+  // tumble on the spot and produces essentially no rebound. The rigid box
+  // collider instead converts corner-first hits into angular energy —
+  // flips and skitters a real bag never shows. On any frame where a bag's
+  // velocity changed sharply while touching the board/ground, bleed off the
+  // X/Z (tumble/flip) spin and cap the upward rebound.
+  //
+  // Deliberately preserved:
+  //   - Y flat-spin (the slide throw's 14–32 rad/s skid rotation).
+  //   - Actively-rolling roll-style bags (their end-over-end tumble must
+  //     survive the first board contact to carry them up the slope).
+  // Neutral preset values (tumbleKill 0 / thresholds 99) make this a no-op.
+  applyDeadBagImpacts(dt: number) {
+    const feel = this.physicsFeel;
+    if (feel.tumbleKill <= 0.001 && feel.bounceCapUp >= 98) return;
+    if (feel.impactSeverityMin >= 98) return;
+
+    for (let i = 0; i < this.bagBodies.length; i++) {
+      if (!this.bags[i]?.visible || this.bagInHole[i]) continue;
+      const body = this.bagBodies[i];
+      const pre = this.bagPreStepVelocities[i];
+      if (!pre) continue;
+
+      // Severity = how much the solver changed this bag's velocity beyond
+      // what gravity alone would have (an approximation — good to ~1 frame).
+      const dvx = body.velocity.x - pre.x;
+      const dvy = body.velocity.y - (pre.y + GRAVITY * dt);
+      const dvz = body.velocity.z - pre.z;
+      const severity = Math.sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
+      if (severity < feel.impactSeverityMin) continue;
+
+      // Only for board/ground impacts — bag-on-bag contact is its own system
+      // (applyBagBagImpacts). The rebound cap must act along the surface
+      // normal, NOT along world Y — a bag skidding up the tilted board
+      // carries legitimate upward velocity that a world-Y cap would strangle
+      // (measured: it cost ~0.45 m of slide and every hole capture).
+      if (!this.bagTouchSurface[i]) continue;
+      const normal = this.bagSurfaceNormals[i];
+
+      // Roll-style bags are exempt entirely: end-over-end tumble IS the roll
+      // mechanic (killing the X spin near the hole was measured to cost its
+      // captures), and its hop-and-carry travel depends on small rebounds.
+      if (this.bagThrowStyles[i] === 'roll') continue;
+
+      const kill = feel.tumbleKill * THREE.MathUtils.clamp(severity / 6, 0, 1);
+      if (kill > 0.001) {
+        body.angularVelocity.x *= 1 - kill;
+        body.angularVelocity.z *= 1 - kill;
+      }
+      // Cap only the separating (rebound) component along the surface normal;
+      // motion along the surface — the skid — is untouched.
+      const separating = body.velocity.x * normal.x + body.velocity.y * normal.y + body.velocity.z * normal.z;
+      if (separating > feel.bounceCapUp) {
+        const excess = separating - feel.bounceCapUp;
+        body.velocity.x -= excess * normal.x;
+        body.velocity.y -= excess * normal.y;
+        body.velocity.z -= excess * normal.z;
+      }
+    }
+  }
+
   // Zero out the outward-normal velocity component when a bag contacts the
   // board's front face, so it drops instead of bouncing back toward the thrower.
   // Why: the front face is near-vertical; even with tiny restitution the solver
@@ -1660,6 +2000,7 @@ export class CornholeGame {
       fillOffsetX: 0,
       fillOffsetY: 0,
       fillOffsetZ: 0,
+      airFlex: 0,
       isDeforming: false,
       prevSettled: false,
     };
@@ -1685,6 +2026,7 @@ export class CornholeGame {
     visual.fillOffsetX = 0;
     visual.fillOffsetY = 0;
     visual.fillOffsetZ = 0;
+    visual.airFlex = 0;
     visual.isDeforming = false;
     visual.prevSettled = false;
     this.bags[index].scale.set(1, 1, 1);
@@ -2675,7 +3017,7 @@ export class CornholeGame {
     const vy = isRollThrow
       ? THREE.MathUtils.lerp(arcVy * 0.95, arcVy * 0.5, speedT)
       : THREE.MathUtils.lerp(arcVy * 1.02, arcVy * 0.38, speedT);
-    const vx = dx / flightTime + this.aimX * 0.35 + (Math.random() - 0.5) * 0.18;
+    const vx = dx / flightTime + this.aimX * 0.35 + (this.throwRandom() - 0.5) * 0.18;
     const vz = dz / flightTime;
     const windLaunchDrift = this.weatherEnabled ? this.windMph * 0.035 : 0;
     const launchSpeedScale = 1.1 * this.getTemperatureSpeedFactor() / this.getHumidityDragFactor();
@@ -2692,15 +3034,15 @@ export class CornholeGame {
       // the board, the spin and momentum roll it forward up the slope into the hole.
       const rollSpinSpeed = THREE.MathUtils.lerp(this.rollTuning.spinLow, this.rollTuning.spinHigh, speedT);
       body.angularVelocity.set(
-        -rollSpinSpeed + THREE.MathUtils.lerp(-0.3, 0.3, Math.random()),
-        this.aimX * 0.5 + THREE.MathUtils.lerp(-0.12, 0.12, Math.random()),
-        THREE.MathUtils.lerp(-0.18, 0.18, Math.random())
+        -rollSpinSpeed + THREE.MathUtils.lerp(-0.3, 0.3, this.throwRandom()),
+        this.aimX * 0.5 + THREE.MathUtils.lerp(-0.12, 0.12, this.throwRandom()),
+        THREE.MathUtils.lerp(-0.18, 0.18, this.throwRandom())
       );
     } else {
       body.angularVelocity.set(
-        THREE.MathUtils.lerp(-0.8, 0.8, Math.random()),
+        THREE.MathUtils.lerp(-0.8, 0.8, this.throwRandom()),
         THREE.MathUtils.lerp(14, 32, speedT),
-        -this.aimX * 1.2 + THREE.MathUtils.lerp(-0.5, 0.5, Math.random())
+        -this.aimX * 1.2 + THREE.MathUtils.lerp(-0.5, 0.5, this.throwRandom())
       );
     }
 
@@ -3070,6 +3412,19 @@ export class CornholeGame {
       body.angularDamping = isSticky ? 0.72 : 0.34;
     }
 
+    // A bag whose only support is another bag: real bags drape and stay put
+    // on each other (corn conforms to the bag underneath). When it's slow,
+    // add heavy damping so it settles on top instead of jittering off.
+    const onlyBagSupport = this.bagTouchBag[bagIndex] && !this.bagTouchSurface[bagIndex];
+    if (onlyBagSupport
+      && !activelyRolling
+      && horizontalSpeed < 0.35
+      && Math.abs(body.velocity.y) < 0.6
+      && this.physicsFeel.stackSettleDamping > 0.001) {
+      body.linearDamping = Math.max(body.linearDamping, this.physicsFeel.stackSettleDamping);
+      body.angularDamping = Math.max(body.angularDamping, this.physicsFeel.stackSettleDamping);
+    }
+
     // Prevent bag from standing on its side. A real bean bag is a loose sack of
     // corn — its center of mass shifts the moment it tilts, so it physically cannot
     // balance on an edge. We model that by always applying a tipping torque
@@ -3088,8 +3443,11 @@ export class CornholeGame {
       const angularSpeed = body.angularVelocity.length();
       const motionScale = THREE.MathUtils.clamp(1 - angularSpeed / 4.5, 0, 1);
       // Ramp strength with tilt² so nearly-flat bags get only a whisper but
-      // near-vertical bags get a firm shove toward flat.
-      const tipStrength = 0.55 * tiltFactor * tiltFactor * motionScale;
+      // near-vertical bags get a firm shove toward flat. A bag resting ON
+      // another bag may legitimately sit tilted (draped over it) — relax the
+      // torque there so it isn't shoved off the stack.
+      const stackRelief = onlyBagSupport ? 1 - this.physicsFeel.stackTipRelief : 1;
+      const tipStrength = 0.55 * tiltFactor * tiltFactor * motionScale * stackRelief;
       const torqueAxis = new CANNON.Vec3(-worldUp.z, 0, worldUp.x);
       if (torqueAxis.length() > 0.01 && tipStrength > 0.001) {
         torqueAxis.normalize();
@@ -3224,6 +3582,10 @@ export class CornholeGame {
     visual.wobbleAmplitude = THREE.MathUtils.damp(visual.wobbleAmplitude, 0, surfaceContact ? 2.25 : 1.15, dt);
     visual.wobbleTime += dt * (5.8 + horizontalSpeed * 1.15 + holeInfluence * 3.3);
     visual.deformAmount = THREE.MathUtils.damp(visual.deformAmount, surfaceContact ? settleAmount * this.bagTuning.deformRetain : 0, surfaceContact ? 3.5 : 6.0, dt);
+    // In-flight floppiness blend: ramps up while airborne, collapses fast
+    // (~100 ms) on touchdown so the air flex hands off to the impact flatten.
+    const wantAirFlex = !surfaceContact && this.bagLook.flightFlex > 0.001 ? 1 : 0;
+    visual.airFlex = THREE.MathUtils.damp(visual.airFlex, wantAirFlex, wantAirFlex > 0 ? 9 : 22, dt);
 
     // --- Fill shifting: corn settles toward gravity-relative low point (only when on surface) ---
     const sloshing = visual.impactSquash > 0.02;
@@ -3267,7 +3629,8 @@ export class CornholeGame {
 
     // --- Determine if per-vertex update is needed ---
     const totalDeform = visual.deformAmount + visual.squash + holeInfluence
-      + Math.abs(visual.fillOffsetX) + Math.abs(visual.fillOffsetZ);
+      + Math.abs(visual.fillOffsetX) + Math.abs(visual.fillOffsetZ)
+      + visual.airFlex * this.bagLook.flightFlex;
     const isSettled = totalDeform < 0.005 && !sloshing && visual.wobbleAmplitude < 0.003;
 
     if (isSettled && visual.prevSettled) {
@@ -3285,11 +3648,44 @@ export class CornholeGame {
     const bagHalfH = bagHeight * 0.5;
 
     // Precompute the inverse mesh quaternion so we can transform board-local coords into bag-local
-    const meshQuatInv = mesh.quaternion.clone().invert();
-    // Board edge positions in bag-local space (for drape)
-    const boardWorldPos = new THREE.Vector3();
-    this.boardGroup.getWorldPosition(boardWorldPos);
+    const meshQuatInv = this.bagDeformQuatInv.copy(mesh.quaternion).invert();
     const holeWorldPos = this.getHoleWorldPosition();
+
+    // Pass-0 context: in-flight floppiness. A flying bag flexes — rim droops
+    // toward gravity, the leading edge curls against the airflow, flat spin
+    // bulges it outward, free edges flutter. All bag-local displacements are
+    // derived once per bag here; the loop only does scalar math.
+    const flightFlex = visual.airFlex * this.bagLook.flightFlex;
+    let flexSpeedNorm = 0;
+    let flexDirX = 0;
+    let flexDirZ = 0;
+    let flexSpinNorm = 0;
+    let flexDownX = 0;
+    let flexDownY = -1;
+    let flexDownZ = 0;
+    let flutterPhase = 0;
+    if (flightFlex > 0.001) {
+      const vel = this.bagDeformLocalVel.set(body.velocity.x, body.velocity.y, body.velocity.z);
+      flexSpeedNorm = THREE.MathUtils.clamp(vel.length() / 11, 0, 1);
+      vel.applyQuaternion(meshQuatInv); // world → bag-local
+      const latSpeed = Math.hypot(vel.x, vel.z);
+      if (latSpeed > 0.05) {
+        flexDirX = vel.x / latSpeed;
+        flexDirZ = vel.z / latSpeed;
+      }
+      // World-down expressed in bag-local space, so droop always sags toward
+      // the ground no matter how the bag is oriented mid-tumble.
+      const down = this.bagDeformWorldVert.set(0, -1, 0).applyQuaternion(meshQuatInv);
+      flexDownX = down.x;
+      flexDownY = down.y;
+      flexDownZ = down.z;
+      // Flat (pancake) spin: the angular velocity component about the bag's
+      // own up axis. Drives the centrifugal bulge.
+      const up = this.bagDeformSurfacePoint.set(0, 1, 0).applyQuaternion(mesh.quaternion);
+      const spinAboutUp = body.angularVelocity.x * up.x + body.angularVelocity.y * up.y + body.angularVelocity.z * up.z;
+      flexSpinNorm = THREE.MathUtils.clamp(Math.abs(spinAboutUp) / 28, 0, 1);
+      flutterPhase = this.totalTime * this.bagLook.flutterSpeed;
+    }
 
     // Conform pass context: when resting on a surface with low vertical speed,
     // flatten the bag's contact face against the real board/ground plane. This
@@ -3311,6 +3707,38 @@ export class CornholeGame {
       const xNorm = THREE.MathUtils.clamp(rx / BAG_SIZE, -1, 1);
       const yNorm = THREE.MathUtils.clamp(ry / bagHalfH, -1, 1);
       const zNorm = THREE.MathUtils.clamp(rz / BAG_SIZE, -1, 1);
+
+      // === 0. In-flight flex (floppy sack in the air) ===
+      if (flightFlex > 0.001) {
+        const rimBlend = Math.max(Math.abs(xNorm), Math.abs(zNorm));
+        const rimW = rimBlend * rimBlend;
+        // Rim droop toward world-down: the unsupported edges of a loose sack
+        // sag below its center. Speed adds a touch more (fabric pulled taut).
+        const droop = this.bagLook.rimDroop * flightFlex * rimW * bagHalfH * (0.45 + 0.55 * flexSpeedNorm);
+        // Aero curl along the direction of travel: leading edge lifts against
+        // the airflow, trailing edge sags. Applied against world-down so it
+        // reads correctly whatever the bag's orientation.
+        const along = xNorm * flexDirX + zNorm * flexDirZ;
+        const curl = this.bagLook.aeroCurl * flightFlex * flexSpeedNorm * along * rimW * bagHalfH;
+        const sag = droop - curl;
+        rx += flexDownX * sag;
+        ry += flexDownY * sag;
+        rz += flexDownZ * sag;
+        // Centrifugal bulge from flat spin: rim pushes outward, bag thins.
+        const bulge = this.bagLook.spinBulge * flightFlex * flexSpinNorm;
+        if (bulge > 0.0001) {
+          const radial = 1 + bulge * (1 - Math.abs(yNorm) * 0.3);
+          rx *= radial;
+          rz *= radial;
+          ry *= 1 - bulge * 0.5;
+        }
+        // Edge flutter: deterministic phase from the vertex's rest position —
+        // no per-frame randomness, so host and guest render the same ripple.
+        const flutter = this.bagLook.flutterAmp * flightFlex * (0.3 + 0.7 * flexSpeedNorm) * rimW * bagHalfH;
+        if (flutter > 0.0001) {
+          ry += Math.sin(flutterPhase + xNorm * 5.1 + zNorm * 7.3) * flutter;
+        }
+      }
 
       // === 1. Impact flattening ===
       if (visual.deformAmount > 0.001) {
@@ -3361,7 +3789,7 @@ export class CornholeGame {
 
       // === 4. Drape at board edges and hole rim, plus surface conform ===
       // Transform this vertex from bag-local to world space once; reuse for all world-space checks.
-      const worldVert = new THREE.Vector3(rx, ry, rz);
+      const worldVert = this.bagDeformWorldVert.set(rx, ry, rz);
       worldVert.applyQuaternion(mesh.quaternion);
       worldVert.add(mesh.position);
 
@@ -3383,7 +3811,7 @@ export class CornholeGame {
         }
 
         // Board edge drape: vertices past board boundaries droop with a smooth quadratic falloff.
-        const boardLocalVert = worldVert.clone();
+        const boardLocalVert = this.bagDeformBoardLocal.copy(worldVert);
         this.boardGroup.worldToLocal(boardLocalVert);
         const overhangX = Math.max(0, Math.abs(boardLocalVert.x) - boardHalfW);
         const overhangZ = Math.max(
@@ -3409,7 +3837,7 @@ export class CornholeGame {
         const worldVy = worldVert.y + worldDy;
 
         // Inverse-transform (already displaced) vertex into board-local space to test footprint.
-        const boardLocal = worldVert.clone();
+        const boardLocal = this.bagDeformBoardLocal.copy(worldVert);
         boardLocal.x += worldDx; boardLocal.y += worldDy; boardLocal.z += worldDz;
         this.boardGroup.worldToLocal(boardLocal);
         const inBoardFootprint =
@@ -3424,7 +3852,7 @@ export class CornholeGame {
         if (inBoardFootprint && !inHole) {
           // Project onto the board's top plane (local y = BOARD_THICKNESS/2), then
           // transform back to world to get the true (tilted) surface Y beneath this vertex.
-          const surfacePoint = new THREE.Vector3(boardLocal.x, BOARD_THICKNESS / 2, boardLocal.z);
+          const surfacePoint = this.bagDeformSurfacePoint.set(boardLocal.x, BOARD_THICKNESS / 2, boardLocal.z);
           this.boardGroup.localToWorld(surfacePoint);
           surfaceY = surfacePoint.y;
         }
@@ -3450,7 +3878,7 @@ export class CornholeGame {
 
       // Apply any accumulated world-space displacement back in bag-local coords.
       if (worldDx !== 0 || worldDy !== 0 || worldDz !== 0) {
-        const worldDelta = new THREE.Vector3(worldDx, worldDy, worldDz);
+        const worldDelta = this.bagDeformWorldDelta.set(worldDx, worldDy, worldDz);
         worldDelta.applyQuaternion(meshQuatInv);
         rx += worldDelta.x;
         ry += worldDelta.y;
@@ -4255,6 +4683,51 @@ export class CornholeGame {
       }
       this.render();
     };
+    window.testSetup = () => {
+      this.setWeatherEnabled(false);
+      this.slowMotionEnabled = false;
+    };
+    window.testThrow = (opts) => {
+      this.throwRandom = mulberry32(opts.seed ?? 1);
+      if (opts.style !== undefined) this.throwStyle = opts.style;
+      if (opts.side !== undefined) this.selectedBagSide = opts.side;
+      this.aimX = opts.aimX ?? 0;
+      // pullDistance drives landing depth, aimPower drives launch speed; the
+      // harness pins both to the same value so one knob describes the throw.
+      this.pullDistance = opts.pull;
+      this.aimPower = opts.pull;
+      this.throwBag();
+      return this.state.isThrowing;
+    };
+    window.testSnapshot = () => ({
+      bags: this.bags.map((bag, index) => {
+        const body = this.bagBodies[index];
+        return {
+          index,
+          visible: bag.visible,
+          inHole: this.bagInHole[index],
+          x: body.position.x, y: body.position.y, z: body.position.z,
+          qx: body.quaternion.x, qy: body.quaternion.y,
+          qz: body.quaternion.z, qw: body.quaternion.w,
+        };
+      }),
+      player1RoundScore: this.state.player1RoundScore,
+      player2RoundScore: this.state.player2RoundScore,
+      settled: !this.state.isThrowing && !this.state.isSettling,
+    });
+    window.testResetBags = () => {
+      // Clear any in-progress throw so the next testThrow isn't rejected by
+      // throwBag's isThrowing/isSettling guard (a mid-flight reset otherwise
+      // leaves those flags stuck until the settle timer fires).
+      this.state.isThrowing = false;
+      this.state.isSettling = false;
+      this.state.throwingPlayer = null;
+      this.activeThrownBagIndex = null;
+      this.settlingTimer = 0;
+      this.resetBags();
+    };
+    // Direct instance access for scripted inspection (tuning objects, meshes).
+    (window as unknown as Record<string, unknown>).__game = this;
   }
 
   // ====== ANIMATION LOOP ======
@@ -4391,9 +4864,14 @@ export class CornholeGame {
     this.updatePreviewBagMaterials();
 
     if (!this.guestMode) {
+      this.applyPhysicsFeelContacts();
+      this.snapshotBagVelocities();
       this.world.step(1 / 60, dt, 3);
+      this.classifyBagContacts();
       this.suppressFrontEdgeBounce();
       this.suppressBagHoleRimBounce();
+      this.applyDeadBagImpacts(dt);
+      this.applyBagBagImpacts();
       this.applyHoleCaptureAssist(dt);
       this.playActiveBagOnBagImpactSound();
       this.syncPhysicsDebugMeshes();
@@ -4710,6 +5188,43 @@ export class CornholeGame {
         ],
         [
           { label: 'Default', values: ROLL_TUNING_DEFAULT as unknown as Record<string, number> },
+        ],
+      ),
+      buildSection(
+        '🪁 Bag Look (flight flex)',
+        this.bagLook as unknown as Record<string, number>,
+        [
+          { key: 'flightFlex', label: 'Flight flex (master, 0 = rigid)', min: 0, max: 1, step: 0.01 },
+          { key: 'aeroCurl', label: 'Aero curl (leading edge lifts)', min: 0, max: 1, step: 0.01 },
+          { key: 'rimDroop', label: 'Rim droop (edges sag)', min: 0, max: 1, step: 0.01 },
+          { key: 'spinBulge', label: 'Spin bulge (pancake spin)', min: 0, max: 0.25, step: 0.005 },
+          { key: 'flutterAmp', label: 'Edge flutter amount', min: 0, max: 0.3, step: 0.005 },
+          { key: 'flutterSpeed', label: 'Edge flutter speed', min: 0, max: 24, step: 0.5 },
+        ],
+        [
+          { label: 'Off', values: BAG_LOOK_OFF as unknown as Record<string, number> },
+          { label: 'Default', values: BAG_LOOK_DEFAULT as unknown as Record<string, number> },
+        ],
+      ),
+      buildSection(
+        '💀 Bag Physics Feel',
+        this.physicsFeel as unknown as Record<string, number>,
+        [
+          { key: 'contactStiffnessExp', label: 'Board contact stiffness (10^x, 7 = hard)', min: 5, max: 7, step: 0.1 },
+          { key: 'contactRelaxation', label: 'Board contact relaxation (mushiness)', min: 2, max: 6, step: 0.5 },
+          { key: 'bagBagStiffnessExp', label: 'Bag-bag contact stiffness (10^x)', min: 5, max: 7, step: 0.1 },
+          { key: 'bagBagRelaxation', label: 'Bag-bag contact relaxation', min: 2, max: 6, step: 0.5 },
+          { key: 'tumbleKill', label: 'Tumble kill on impact (dead-sack)', min: 0, max: 1, step: 0.05 },
+          { key: 'bounceCapUp', label: 'Rebound cap m/s (99 = off)', min: 0, max: 99, step: 0.05 },
+          { key: 'impactSeverityMin', label: 'Hard-impact threshold m/s (99 = off)', min: 0.5, max: 99, step: 0.1 },
+          { key: 'bagBagAngularKill', label: 'Bag-bag spin kill (dead shoves)', min: 0, max: 1, step: 0.05 },
+          { key: 'strikerEnergyLoss', label: 'Striker energy loss (soft hit)', min: 0, max: 0.5, step: 0.02 },
+          { key: 'stackTipRelief', label: 'Stack drape (rest tilted on a bag)', min: 0, max: 1, step: 0.05 },
+          { key: 'stackSettleDamping', label: 'Stack settle damping', min: 0, max: 1, step: 0.05 },
+        ],
+        [
+          { label: 'Current', values: PHYSICS_FEEL_CURRENT as unknown as Record<string, number> },
+          { label: 'Best', values: PHYSICS_FEEL_BEST as unknown as Record<string, number> },
         ],
       ),
     );
@@ -5182,6 +5697,12 @@ export class CornholeGame {
         samples.length = 0;
         mesh.position.set(bag.x, bag.y, bag.z);
         mesh.quaternion.set(bag.qx, bag.qy, bag.qz, bag.qw);
+        // Restart the velocity estimator so the replant never reads as motion.
+        if (this.guestBagVelInit.length > bag.index) {
+          this.guestBagVelInit[bag.index] = false;
+          this.guestBagVel[bag.index].set(0, 0, 0);
+          this.guestBagAngVel[bag.index].set(0, 0, 0);
+        }
       }
       samples.push({
         t: now,
@@ -5207,6 +5728,11 @@ export class CornholeGame {
   private ensureGuestBagSamples() {
     if (this.guestBagSamples.length === this.bags.length) return;
     this.guestBagSamples = this.bags.map(() => []);
+    this.guestBagPrevPos = this.bags.map(() => new THREE.Vector3());
+    this.guestBagPrevQuat = this.bags.map(() => new THREE.Quaternion());
+    this.guestBagVel = this.bags.map(() => new THREE.Vector3());
+    this.guestBagAngVel = this.bags.map(() => new THREE.Vector3());
+    this.guestBagVelInit = this.bags.map(() => false);
   }
 
   // Called each render frame on the guest. For each visible bag, picks the
@@ -5217,6 +5743,11 @@ export class CornholeGame {
   private stepGuestInterpolation(_dt: number) {
     if (!this.guestMode || this.guestBagSamples.length === 0) return;
     const now = performance.now() / 1000;
+    // Real elapsed time between interpolation passes — the interpolated motion
+    // runs on the wall clock, so velocity estimates must too (not the possibly
+    // slow-mo-scaled sim dt).
+    const dtReal = THREE.MathUtils.clamp(now - this.guestVelPrevNow, 0.001, 0.1);
+    this.guestVelPrevNow = now;
     // Ramp up render delay gradually on the first snapshot so we don't
     // visually freeze for 110ms waiting for the buffer to fill.
     const sinceFirst = now - this.guestFirstSnapshotAt;
@@ -5268,6 +5799,57 @@ export class CornholeGame {
       mesh.quaternion.copy(a.quat).slerp(b.quat, Math.min(1, progress));
       body.position.set(mesh.position.x, mesh.position.y, mesh.position.z);
       body.quaternion.set(mesh.quaternion.x, mesh.quaternion.y, mesh.quaternion.z, mesh.quaternion.w);
+
+      // --- Velocity estimation from interpolated motion ---
+      // applyBagVisualSoftness keys impact squash / wobble / fill slosh off
+      // body.velocity, which the guest's un-stepped physics world never fills
+      // in (snapshots arrive with velocity zeroed). Reconstruct it from the
+      // frame-to-frame interpolated motion so the deformation system behaves
+      // the same as on the host. The estimate is smoothed lightly to iron out
+      // sample-boundary steps in the piecewise-linear interpolation.
+      const prevPos = this.guestBagPrevPos[i];
+      const prevQuat = this.guestBagPrevQuat[i];
+      const vel = this.guestBagVel[i];
+      const angVel = this.guestBagAngVel[i];
+      const jumpX = mesh.position.x - prevPos.x;
+      const jumpY = mesh.position.y - prevPos.y;
+      const jumpZ = mesh.position.z - prevPos.z;
+      const jump = Math.sqrt(jumpX * jumpX + jumpY * jumpY + jumpZ * jumpZ);
+      if (!this.guestBagVelInit[i] || jump > 1.2) {
+        // First sample ever, or a teleport (fresh-throw replant / reset):
+        // don't turn the position jump into a velocity spike.
+        vel.set(0, 0, 0);
+        angVel.set(0, 0, 0);
+      } else {
+        const invDt = 1 / dtReal;
+        const smooth = 1 - Math.exp(-30 * dtReal);
+        vel.x += (jumpX * invDt - vel.x) * smooth;
+        vel.y += (jumpY * invDt - vel.y) * smooth;
+        vel.z += (jumpZ * invDt - vel.z) * smooth;
+
+        // Angular velocity from the world-frame quaternion delta.
+        this.guestVelScratchQuatInv.copy(prevQuat).invert();
+        this.guestVelScratchQuat.copy(mesh.quaternion).multiply(this.guestVelScratchQuatInv);
+        let qw = this.guestVelScratchQuat.w;
+        let sign = 1;
+        if (qw < 0) { qw = -qw; sign = -1; }
+        const halfAngleSin = Math.sqrt(Math.max(0, 1 - qw * qw));
+        if (halfAngleSin > 1e-4) {
+          const angle = 2 * Math.acos(Math.min(1, qw));
+          const axisScale = (sign * angle * invDt) / halfAngleSin;
+          angVel.x += (this.guestVelScratchQuat.x * axisScale - angVel.x) * smooth;
+          angVel.y += (this.guestVelScratchQuat.y * axisScale - angVel.y) * smooth;
+          angVel.z += (this.guestVelScratchQuat.z * axisScale - angVel.z) * smooth;
+        } else {
+          angVel.multiplyScalar(1 - smooth);
+        }
+      }
+      prevPos.copy(mesh.position);
+      prevQuat.copy(mesh.quaternion);
+      this.guestBagVelInit[i] = true;
+
+      body.velocity.set(vel.x, vel.y, vel.z);
+      body.angularVelocity.set(angVel.x, angVel.y, angVel.z);
     }
   }
 }
